@@ -1,0 +1,78 @@
+name: print-job-watch
+version: 0.1.0
+manifest_version: 2
+requires_hermes: ">=0.21.4"
+description: >-
+  Watch one printer from Hermes. This plugin can be used with OctoPrint.
+  OctoPrint is a registered trademark owned by Gina Häußge (https://octoprint.org).
+  Built on the OctoPrint REST API.
+  Read job state, connection state, completion, temperatures, printTimeLeft,
+  and optionally one webcam still. printTimeLeft is returned as OctoPrint sent
+  it, including 0. A disconnected printer (connection Closed or Offline, or job
+  Offline) is not described as paused. Error and Offline after error are errors
+  even when GET /api/printer returns 409. A 409 by itself is not a state.
+  Pause, resume, or cancel only after a person approves that one call through
+  Hermes. An earlier session or always answer is not reused. Answering always adds one
+  unused allowlist line; choose once. That line does not approve the next move.
+  Nothing is sent on cron, yolo, approvals
+  off, single-query, unattended, a plugins.isolation host process, or when that
+  check cannot be loaded. POST /api/job sends command pause with action pause
+  or resume, or command cancel with no action. Pause is sent only for Printing and Printing from SD, not for Paused.
+  It is not sent during Resuming or a state that starts with Starting, including
+  Starting print from SD and Starting to send file to SD. HTTP 204 means accepted, not finished. Pausing is not a failure;
+  resume is not sent during Pausing. On OctoPrint 1.11.8, resume during Pausing
+  does not continue the print. A move is reported only when a later read
+  shows Paused, Printing, or Operational.
+  A cron watch can report printer_disconnected, error, complete (after Printing,
+  Printing from SD, Pausing, Paused, Resuming, or Finishing), paused (after Printing,
+  Printing from SD, Pausing, or Resuming), cancelled, and stalled (Printing or Printing from SD). It
+  does not move the printer. Slash and CLI watches only read; they do not update
+  the cron watch. A later chat failure does not send a cron event again. A redirect is not followed onto another host, so the API key
+  is not sent there. In process, an unreachable printer is reported once per
+  cause, then once a day, and once when it recovers. Under plugins.isolation: host, this form cannot watch the printer. Set plugins.isolation to in_process. Each run is at least one model
+  turn. If the schedule is every 5 minutes, that is 288 runs a day. A turn that calls a tool makes two or
+  more model requests. Removing the plugin leaves the cron job; run hermes print-job-watch unschedule.
+author: TakeshiTGAL
+license: MIT
+homepage: https://github.com/TakeshiTGAL/hermes-plugin-print-job-watch
+tags: [printer, cron]
+provides_tools:
+  - print_job_status
+  - print_job_control
+  - print_job_watch
+requires_env:
+  - name: OCTOPRINT_URL
+    description: "Single OctoPrint origin, for example http://printer.example:5000. No path, query, or userinfo. Plain http sends the API key unencrypted."
+    prompt: "OctoPrint origin"
+    secret: false
+    password: false
+  - name: OCTOPRINT_API_KEY
+    description: "OctoPrint user API key. Sent only as the X-Api-Key header. An empty key is not sent. Never use the global key from /api/settings."
+    prompt: "OctoPrint API key"
+    secret: true
+    password: true
+optional_env:
+  - name: OCTOPRINT_SNAPSHOT_URL
+    description: "Optional webcam still URL. Must be the same hostname as OCTOPRINT_URL. A different port is allowed. JPEG or PNG only."
+    prompt: "Webcam snapshot URL (optional)"
+    secret: false
+    password: false
+config_schema:
+  stall_minutes:
+    type: int
+    default: 10
+    label: Minutes before a stall
+    description: >-
+      While the job state is Printing or Printing from SD, a watch tick reports a stall only when
+      filepos is a number and the file position, completion, and filename have
+      all stayed the same for this many minutes. A missing filepos is not a
+      stall. Paused is not a stall. Clamped to 1-240. Tool arguments cannot
+      change it.
+  snapshot_max_bytes:
+    type: int
+    default: 2000000
+    label: Largest webcam still to keep
+    description: >-
+      Bytes. Clamped to 1-5000000. A larger download (or a larger declared
+      Content-Length), or one shorter than Content-Length, is discarded and not
+      saved. Tool arguments cannot raise it.
