@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import time
-import uuid
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,9 +29,10 @@ if __package__:
         approval_text,
         in_plugin_host_process,
         motion_block_reason,
+        plan_digest,
         plugin_data_dir,
         reason_fits,
-        request_motion_approval,
+        take_move,
         write_guard_error,
     )
 else:
@@ -50,9 +52,10 @@ else:
         approval_text,
         in_plugin_host_process,
         motion_block_reason,
+        plan_digest,
         plugin_data_dir,
         reason_fits,
-        request_motion_approval,
+        take_move,
         write_guard_error,
     )
 
@@ -82,16 +85,23 @@ def dumps(body: dict[str, Any]) -> str:
     return json.dumps(body, ensure_ascii=True, sort_keys=True)
 
 
+_REMEMBERED_PROFILE: str | None = None
+
+
+def remember_profile_name(reported: Any) -> None:
+    """Store the public ctx.profile_name. An unusable value is forgotten."""
+    global _REMEMBERED_PROFILE
+    if isinstance(reported, str) and _PROFILE_NAME.fullmatch(reported.strip()):
+        _REMEMBERED_PROFILE = reported.strip()
+        return
+    _REMEMBERED_PROFILE = None
+
+
 def active_profile_name() -> str:
-    """Hermes profile for printed commands. default when the helper cannot be read."""
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-        name = get_active_profile_name()
-    except Exception:
+    """Printed profile. default when register did not capture a usable name."""
+    if not _REMEMBERED_PROFILE:
         return "default"
-    if not isinstance(name, str) or not _PROFILE_NAME.fullmatch(name.strip()):
-        return "default"
-    return name.strip() or "default"
+    return _REMEMBERED_PROFILE
 
 
 def hermes_line(command: str) -> str:
@@ -103,9 +113,33 @@ def hermes_line(command: str) -> str:
 
 
 def fail(code: str, message: str, next_step: str, **extra: Any) -> str:
-    body = {"ok": False, "error": code, "message": message, "next_step": next_step, "moved": False}
+    body = {
+        "ok": False, "error": code, "error_type": code,
+        "message": message, "next_step": next_step, "moved": False,
+    }
     body.update(extra)
     return dumps(body)
+
+
+def _fold_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = unicodedata.normalize("NFKC", value).strip().lower()
+        if text == "true":
+            return True
+        if text == "false":
+            return False
+    return None
+
+
+def _fold_motion(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFKC", value).strip().lower()
+    if text in {"pause", "resume", "cancel"}:
+        return text
+    return None
 
 
 @dataclass
@@ -123,6 +157,7 @@ class Deps:
     blocker: Callable[[str], str | None] | None = None
     write_guard: Callable[[str], str | None] | None = None
     cron_module: Any = None
+    cron_run: Any = None
     control_timeout: float = CONTROL_TIMEOUT_SECONDS
 
 
@@ -229,10 +264,24 @@ def _guard(deps: Deps) -> Callable[[str], str | None]:
     return deps.write_guard or write_guard_error
 
 
+_STATUS_EXTRA = (
+    "print_job_status accepts only include_snapshot, so drop other arguments and call again, "
+    "for example include_snapshot false."
+)
+_STATUS_BOOL = (
+    "include_snapshot must be true or false, so pass a boolean or omit it, for example include_snapshot false."
+)
+
+
 def status(deps: Deps, args: dict[str, Any] | None) -> str:
-    args = args or {}
+    args = dict(args or {})
     if any(key not in {"include_snapshot"} for key in args):
-        return fail("bad_args", "print_job_status accepts only include_snapshot.", "Drop the other arguments. The URL cannot be changed from here.")
+        return fail("bad_args", _STATUS_EXTRA, _STATUS_EXTRA)
+    if "include_snapshot" in args:
+        folded = _fold_bool(args["include_snapshot"])
+        if folded is None:
+            return fail("bad_args", _STATUS_BOOL, _STATUS_BOOL)
+        args["include_snapshot"] = folded
     try:
         sample = read_sample(_client(deps))
     except ApiError as error:
@@ -368,11 +417,26 @@ def _not_sent(action: str, decision: str, sample: dict[str, Any]) -> str:
     })
 
 
-def control(deps: Deps, args: dict[str, Any] | None) -> str:
-    args = args or {}
-    action = args.get("action")
-    if not isinstance(action, str) or set(args) - {"action"}:
-        return fail("bad_args", "print_job_control requires action pause, resume, or cancel and no other arguments.", "Do not send G-code or a temperature.")
+_CONTROL_EXTRA = (
+    "print_job_control accepts only action, so drop other arguments and pass pause, resume, or cancel, "
+    "for example action pause."
+)
+_CONTROL_MISSING = "action is required, so pass pause, resume, or cancel, for example action pause."
+_CONTROL_BAD = (
+    "action must be pause, resume, or cancel, so pass one of those and not G-code or a temperature, "
+    "for example action pause."
+)
+
+
+def control(deps: Deps, args: dict[str, Any] | None, **kwargs: Any) -> str:
+    args = dict(args or {})
+    if set(args) - {"action"}:
+        return fail("bad_args", _CONTROL_EXTRA, _CONTROL_EXTRA)
+    if "action" not in args or args.get("action") in (None, ""):
+        return fail("bad_args", _CONTROL_MISSING, _CONTROL_MISSING)
+    action = _fold_motion(args.get("action"))
+    if action is None:
+        return fail("bad_args", _CONTROL_BAD, _CONTROL_BAD)
     blocker = deps.blocker or motion_block_reason
     blocked = blocker(action)
     if blocked:
@@ -398,13 +462,17 @@ def control(deps: Deps, args: dict[str, Any] | None) -> str:
             "Shorten OCTOPRINT_URL. Nothing was sent.",
         )
     if deps.approver is None:
-        approved, message, _rule_key = request_motion_approval(action, origin)
+        approved, message = take_move(
+            args,
+            (str(kwargs.get("session_id") or ""), str(kwargs.get("task_id") or "")),
+            (action, origin, text),
+        )
         if not approved:
             return fail("not_approved", message, "Nothing was sent.")
     else:
-        rule_key = f"print_job_control:{action}:{uuid.uuid4().hex}"
+        plan = plan_digest(action, origin)
         try:
-            approved, message = deps.approver(text, rule_key)
+            approved, message = deps.approver(text, plan)
         except Exception:
             return fail("not_approved", "BLOCKED: the approval request failed, so the printer was not moved.", "Nothing was sent.")
         if not approved:
@@ -419,7 +487,12 @@ def control(deps: Deps, args: dict[str, Any] | None) -> str:
         )
     decision = _send_decision(action, sample)
     if decision != "send":
-        return _not_sent(action, decision, sample)
+        body = json.loads(_not_sent(action, decision, sample))
+        body["ok"] = False
+        body["isError"] = True
+        body["error"] = "changed"
+        body["message"] = "The printer changed after the preview. Nothing was sent. " + body["message"]
+        return dumps(body)
     try:
         status_code, _body = client.post_json("/api/job", BODIES[action], deps.control_timeout)
     except ApiError as error:
@@ -521,37 +594,40 @@ def _progress_message(action: str, sample: dict[str, Any]) -> str:
     )
 
 
-def _is_cron_turn() -> bool | None:
-    """True on a visible cron turn, False on a visible manual turn, None when the turn cannot be judged.
+_cron_reader: Callable[[], Any] | None = None
 
-    None covers a host child and a cron helper that cannot be imported, raises, or was renamed.
-    A readable helper that returns False is manual, not None.
+
+def bind_cron_reader(reader: Callable[[], Any] | None) -> None:
+    """Point the watch at Hermes's public cron execution, or None when it cannot be judged."""
+    global _cron_reader
+    _cron_reader = reader
+
+
+def _is_cron_turn() -> bool | None:
+    """True on a cron run, False on a manual run, None when the turn cannot be judged.
+
+    None covers a host child and a missing or raising reader. A reader that returns
+    None is a manual turn: that is what Hermes's current_cron_execution does outside cron.
     """
     if in_plugin_host_process():
         return None
-    try:
-        import importlib
-        mod = importlib.import_module("tools.approval_context")
-    except Exception:
-        return None
-    fn = getattr(mod, "_is_cron_approval_context", None)
-    if not callable(fn):
+    reader = _cron_reader
+    if not callable(reader):
         return None
     try:
-        value = fn()
+        value = reader()
     except Exception:
         return None
-    if value is True:
-        return True
-    if value is False:
+    if value is None:
         return False
-    return None
+    return True
 
 
 def _cannot_watch() -> str:
     return dumps({
         "ok": False,
         "error": "cannot_watch",
+        "error_type": "cannot_watch",
         "moved": False,
         "notify": True,
         "recorded": False,
@@ -561,14 +637,12 @@ def _cannot_watch() -> str:
     })
 
 
+_WATCH_ARGS = "print_job_watch takes no arguments, so call it with an empty object, for example {}."
+
+
 def watch(deps: Deps, args: dict[str, Any] | None, *, record: bool | None = None) -> str:
     if args:
-        return fail(
-            "bad_args",
-            "print_job_watch takes no arguments. This was a wrong call, not a printer failure.",
-            "Call print_job_watch with an empty object. Nothing was checked and nothing was recorded.",
-            notify=True,
-        )
+        return fail("bad_args", _WATCH_ARGS, _WATCH_ARGS, notify=True)
     if record is None:
         cron = _is_cron_turn()
         if cron is None:
@@ -829,42 +903,45 @@ def deliver_looks_like_schedule(deliver: str) -> bool:
     return any(_part_looks_like_schedule(part) for part in deliver.split(","))
 
 
-# The same set as Hermes cron.scheduler_delivery._KNOWN_DELIVERY_PLATFORMS.
 # cli, cron, and api_server are surfaces cron accepts as words and then does not deliver to.
-_DELIVER_PLATFORMS = frozenset({
-    "telegram", "discord", "slack", "whatsapp", "signal",
-    "matrix", "mattermost", "dingtalk", "feishu",
-    "wecom", "wecom_callback", "weixin", "sms", "email", "webhook", "bluebubbles",
-    "qqbot", "yuanbao",
-})
+# origin, local, and all are plugin destinations, not platform names.
 _NEVER_DELIVER = frozenset({"cli", "cron", "api_server"})
 _DELIVER_EXACT = frozenset({"origin", "local", "all"})
 
 
-def _known_deliver_platforms() -> set[str]:
-    names = set(_DELIVER_PLATFORMS)
+def _known_deliver_platforms() -> set[str] | None:
+    """Platforms already registered for cron delivery.
+
+    None when that registry cannot be read. A name counts only when its entry
+    has a cron delivery env var. An unreadable registry is not a frozen list.
+    """
     try:
-        from cron.scheduler_delivery import _KNOWN_DELIVERY_PLATFORMS
-        names.update(str(name).strip().lower() for name in _KNOWN_DELIVERY_PLATFORMS)
-    except Exception:
-        pass
-    try:
-        from hermes_cli.plugins import discover_plugins
-        discover_plugins()
         from gateway.platform_registry import platform_registry
-        for name in platform_registry.registered_names():
-            text = str(name).strip().lower()
-            entry = platform_registry.get(text)
-            if text and entry is not None and getattr(entry, "cron_deliver_env_var", None):
-                names.add(text)
     except Exception:
-        pass
-    return names - _NEVER_DELIVER
+        return None
+    try:
+        listed = list(platform_registry.registered_names())
+    except Exception:
+        return None
+    found: set[str] = set()
+    for name in listed:
+        text = str(name).strip().lower()
+        if not text or text in _NEVER_DELIVER:
+            continue
+        try:
+            entry = platform_registry.get(text)
+        except Exception:
+            return None
+        if entry is not None and getattr(entry, "cron_deliver_env_var", None):
+            found.add(text)
+    return found
 
 
 def canonical_deliver(deliver: str) -> str | None:
     """A delivery target cron can actually send to, or None. Comma combinations are kept."""
     names = _known_deliver_platforms()
+    if names is None:
+        names = set()
     canon: list[str] = []
     for part in deliver.split(","):
         piece = part.strip()
@@ -1049,18 +1126,133 @@ def _cron_min_gap_seconds(parts: list[str]) -> int | None:
     return 366 * 24 * 3600 if smallest is None else smallest
 
 
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+class _Cmd:
+    def __init__(self, returncode: int, stdout: str, stderr: str):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _plain(text: str) -> str:
+    return _ANSI.sub("", text or "")
+
+
+def _hermes_bin() -> str:
+    return shutil.which("hermes") or "hermes"
+
+
+def _run_hermes_cron(deps: Deps, args: list[str]) -> _Cmd:
+    """Run ``hermes cron``. ``deps.cron_run`` replaces the child process in tests."""
+    argv = [_hermes_bin(), "cron", *args]
+    runner = deps.cron_run
+    if runner is not None:
+        done = runner(argv)
+        return _Cmd(int(done.returncode), str(done.stdout or ""), str(done.stderr or ""))
+    import subprocess
+    env = os.environ.copy()
+    env["NO_COLOR"] = "1"
+    env["TERM"] = "dumb"
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=60)
+    except OSError as exc:
+        return _Cmd(127, "", f"Could not run hermes ({type(exc).__name__}).")
+    except subprocess.TimeoutExpired:
+        return _Cmd(124, "", "hermes cron timed out.")
+    return _Cmd(int(done.returncode), done.stdout or "", done.stderr or "")
+
+
+def _cron_error(done: _Cmd, fallback: str) -> str:
+    line = _plain(done.stderr or done.stdout).strip().splitlines()
+    detail = line[0].strip() if line else fallback
+    if len(detail) > 180:
+        detail = detail[:179] + "…"
+    return detail or fallback
+
+
+def _parse_created_id(stdout: str) -> str | None:
+    match = re.search(r"Created job:\s*(\S+)", _plain(stdout))
+    return match.group(1) if match else None
+
+
+def _parse_listed_jobs(stdout: str) -> list[dict[str, str]]:
+    jobs: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    for line in _plain(stdout).splitlines():
+        head = re.match(r"^  (\S+) \[", line)
+        if head:
+            if current is not None:
+                jobs.append(current)
+            current = {"id": head.group(1), "name": "", "deliver": ""}
+            continue
+        if current is None:
+            continue
+        name = re.match(r"^\s+Name:\s*(.*)$", line)
+        if name:
+            current["name"] = name.group(1).strip()
+            continue
+        deliver = re.match(r"^\s+Deliver:\s*(.*)$", line)
+        if deliver:
+            current["deliver"] = deliver.group(1).strip()
+    if current is not None:
+        jobs.append(current)
+    return jobs
+
+
+def _cron_unavailable(done: _Cmd, fallback: str) -> ApiError:
+    return ApiError(
+        "no_cron",
+        f"hermes cron failed ({done.returncode}): {_cron_error(done, fallback)}",
+        f"Create the job with {hermes_line('cron create')}. Do not point it at print_job_control.",
+    )
+
+
+class _HermesCron:
+    """Public ``hermes cron`` child. Tests pass ``cron_module`` and never reach this."""
+
+    def __init__(self, deps: Deps) -> None:
+        self.deps = deps
+
+    def list_jobs(self, include_disabled: bool = True) -> list[dict[str, str]]:
+        done = _run_hermes_cron(self.deps, ["list", "--all"])
+        if done.returncode != 0:
+            raise _cron_unavailable(done, "hermes cron list failed, so no job was created.")
+        text = _plain(done.stdout)
+        if "Scheduled Jobs" not in text and "No scheduled jobs" not in text:
+            raise ApiError(
+                "no_cron",
+                "hermes cron list did not show a job list, so no job was created.",
+                f"Create the job with {hermes_line('cron create')}. Do not point it at print_job_control.",
+            )
+        return _parse_listed_jobs(text)
+
+    def create_job(self, *, prompt: str, schedule: str, name: str, deliver: str, **_ignored: Any) -> dict[str, str]:
+        done = _run_hermes_cron(self.deps, [
+            "create", schedule, prompt, "--name", name, "--deliver", deliver.strip(),
+        ])
+        if done.returncode != 0:
+            raise _cron_unavailable(done, "hermes cron create failed, so no job was created.")
+        job_id = _parse_created_id(done.stdout)
+        if not job_id:
+            raise ApiError(
+                "no_cron",
+                "hermes cron create finished without a job id, so this plugin will not claim the job exists.",
+                f"Run {hermes_line('cron list')} and remove any half-created print-job-watch job before trying again.",
+            )
+        return {"id": job_id, "schedule_display": schedule, "deliver": deliver.strip(), "name": name}
+
+    def remove_job(self, job_id: str) -> None:
+        done = _run_hermes_cron(self.deps, ["remove", job_id])
+        if done.returncode != 0:
+            raise _cron_unavailable(done, "hermes cron remove failed.")
+
+
 def _cron(deps: Deps) -> Any:
     if deps.cron_module is not None:
         return deps.cron_module
-    try:
-        from cron import jobs
-        return jobs
-    except Exception as error:
-        raise ApiError(
-            "no_cron",
-            f"Hermes cron is not available ({type(error).__name__}).",
-            f"Create the job with {hermes_line('cron create')}. Do not point it at print_job_control.",
-        ) from None
+    return _HermesCron(deps)
 
 
 def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str:
@@ -1100,7 +1292,6 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
         old = next((job for job in listed if job.get("name") == JOB_NAME), None)
         created = jobs.create_job(
             prompt=CRON_PROMPT, schedule=when, name=JOB_NAME, deliver=deliver.strip(),
-            enabled_toolsets=[TOOLSET],
         )
         if old and old.get("id") and old.get("id") != created.get("id"):
             try:
@@ -1137,6 +1328,9 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
         "moved": False,
         "message": (
             f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}). Results are {where}{replaced} "
+            "The create command cannot set enabled_toolsets, so the job uses this profile's platform toolsets "
+            "and may include more than print_job_watch. The prompt tells the agent to call print_job_watch only. "
+            "Pause, resume, and cancel are refused in that cron session, including after always. "
             "Each run is at least one model turn; a turn that calls a tool makes two or more model requests. "
             "If the saved schedule is every 5 minutes, that is 288 runs a day. "
             f"Removing this plugin does not remove the job; run `{hermes_line('print-job-watch unschedule')}` first."
@@ -1154,7 +1348,11 @@ def unschedule(deps: Deps) -> str:
         listed = jobs.list_jobs(include_disabled=True) or []
         old = next((job for job in listed if job.get("name") == JOB_NAME), None)
         if not old:
-            return dumps({"ok": True, "moved": False, "message": "print-job-watch is not scheduled. Watch state was left in place."})
+            return dumps({
+                "ok": True,
+                "moved": False,
+                "message": "print-job-watch is not scheduled. No cron job was found. Watch state was left in place.",
+            })
         jobs.remove_job(old["id"])
     except ApiError as error:
         return fail(error.code, error.message, error.next_step)

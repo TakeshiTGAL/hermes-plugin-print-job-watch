@@ -122,7 +122,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 def default_transport(method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: float, cap: int) -> tuple[int, dict[str, str], bytes]:
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
-    opener = urllib.request.build_opener(_NoRedirect)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
     try:
         with opener.open(request, timeout=timeout) as response:
             payload = response.read(cap + 1)
@@ -214,6 +214,12 @@ class OctoPrint:
                 "Check OCTOPRINT_URL. Nothing was recorded as a print state.",
             ) from error
         if status in {301, 302, 303, 307, 308}:
+            if send_key:
+                raise ApiError(
+                    "redirect",
+                    "OctoPrint redirected a request that carries the API key, so it was not followed.",
+                    "Use the printer origin directly. The key was not sent to the next URL.",
+                )
             location = response_headers.get("location") or ""
             if redirects >= MAX_REDIRECTS or not location:
                 raise ApiError("redirect", "OctoPrint redirected too many times.", "Use the printer origin directly.")

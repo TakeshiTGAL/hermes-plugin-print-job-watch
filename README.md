@@ -6,6 +6,16 @@ This plugin can be used with OctoPrint. It is built on the OctoPrint REST API. T
 
 It does not upload files, start prints, set temperatures, send G-code, connect, or disconnect. It does not speak PrusaLink.
 
+## First request
+
+1. `hermes plugins install TakeshiTGAL/hermes-plugin-print-job-watch --enable`
+2. Set `OCTOPRINT_URL`, such as `http://printer.example:5000`.
+3. Set `OCTOPRINT_API_KEY` to a user API key. Leave access control on.
+4. OctoPrint is already running.
+5. Ask "what is the hotend temperature". The model calls `print_job_status` with no arguments. That call does not ask for approval. Pause uses `print_job_control` with action pause and asks once.
+
+Temperature uses print_job_status with no arguments. 日本語: 温度は引数なしの print_job_status。一時停止は action を pause にして、承認は1回。
+
 ## What you can ask
 
 | Tool | What it does |
@@ -29,19 +39,34 @@ OCTOPRINT_API_KEY=your-user-api-key
 OCTOPRINT_SNAPSHOT_URL=http://printer.example:8080/?action=snapshot
 ```
 
-`OCTOPRINT_URL` is one origin: scheme, host, and optional port. No path, query, user, or password. Plain `http` sends `X-Api-Key` unencrypted. The key is sent only as that header, never in the query string. An empty key is not sent. This plugin never calls `GET /api/settings`.
+`OCTOPRINT_URL` is one origin: scheme, host, and optional port. No path, query, user, or password. Plain `http` sends `X-Api-Key` unencrypted. The key is sent only as that header, never in the query string. An empty key is not sent. A proxy set in the environment is not used, so the API key is not sent to it. This plugin never calls `GET /api/settings`.
+
+Each tool call and each slash command reads `OCTOPRINT_URL`, `OCTOPRINT_API_KEY`, and `OCTOPRINT_SNAPSHOT_URL` for the active Hermes profile through the Hermes secret scope, not from a value kept since startup. On a gateway that serves several profiles from one process, each profile uses its own printer, key, and still URL, and a slash command carries that profile's scope into its worker thread. With a single profile, the values set in the environment are used as before.
 
 Create a user API key in OctoPrint. Do not paste the global key from settings.
 
 OctoPrint's own documentation says that when access control is off, a missing or wrong key is treated as a full admin. Leave access control on.
 
-State is stored under `<HERMES_HOME>/plugin-data/print-job-watch` (one directory per Hermes profile): job state, connection state, filename, completion, file position, print time left, and timestamps, plus the last failure code and up to 20 stills. The API key and the chat user's name are not stored. Stills are saved only after Hermes's write guard allows the path. If you placed this plugin by hand, run `hermes plugins enable print-job-watch` before `hermes print-job-watch` appears.
+State is stored under `<HERMES_HOME>/plugin-data/print-job-watch` (one directory per Hermes profile): job state, connection state, filename, completion, file position, print time left, and timestamps, plus the last failure code and up to 20 stills. The API key and the chat user's name are not stored. Stills are saved only when the path stays inside the plugin data directory. If you placed this plugin by hand, run `hermes plugins enable print-job-watch` before `hermes print-job-watch` appears.
+
+## Skill
+
+The plugin registers one skill, `octoprint-job`. It tells the model to look up `print_job_status`, `print_job_control`, and `print_job_watch` with tool_search, in English, before it tries web_search. The skill runs nothing, sends nothing, and approves nothing by itself. A move still returns an approval line. Session and always cover only the same action at the same origin while a person is present. cron, `hermes -q`, and webhook refuse the move, including after always.
+
+On Hermes 0.21.6 and later, while the plugin is enabled, the skill adds one line to the skills index of every session. That includes a surface where the tools were turned off with `hermes tools`: the line stays there, and the calls are simply unavailable. On Hermes 0.21.4 and 0.21.5 the skill is not listed; it loads only when called by its full name, `print-job-watch:octoprint-job`. There is no separate user list for the skill; every session that loads the plugin can read it. `hermes plugins disable print-job-watch` removes the skill, the tools, and the slash command together. A watch already scheduled is a Hermes cron job that disabling does not remove: run `hermes print-job-watch unschedule` before you disable the plugin, or `hermes cron remove <id>` after.
 
 ## Moves
 
-Every pause, resume, and cancel asks Hermes again. A previous session or always answer is not reused. Choosing always adds one unused `plugin_rule:` line to `command_allowlist`; choose once. That line does not approve a later move. Remove it by editing `command_allowlist` in the Hermes config. If the question, or its HTML-escaped form, is longer than 300 characters, it is not sent and nothing is posted. The wait for a person is `approvals.timeout` (300 seconds unless you changed it). That is not the 300-character limit.
+Every pause, resume, and cancel returns `{"action": "approve", "message": <one line>}` from the `pre_tool_call` hook. Hermes then runs the same human gate as a dangerous shell command (`hermes_cli/plugins.py` `_resolve_block_from_details` calls `tools/approval.py` `request_tool_approval`). The line names the OctoPrint origin and the `POST /api/job` body. `print_job_status` and `print_job_watch` return nothing from the hook. The `rule_key` is a digest of the action and the OctoPrint origin. session and always apply only to that same plan. A different action or origin asks again. Choosing always writes one `plugin_rule:` line to `command_allowlist`. Remove it by editing `command_allowlist` in the Hermes config. If the question, or its HTML-escaped form, is longer than 300 characters, the hook blocks and nothing is posted. The wait for a person is `approvals.timeout` (300 seconds unless you changed it). That is not the 300-character limit. After a yes, the handler reads the printer again and posts only when that plan still matches. If the state changed, it posts nothing and returns `isError`. When the pre_tool_call dispatcher returns BLOCKED, Hermes does not call the handler (`model_tools.py` `handle_function_call` returns at line 942 in v0.22.2 and line 945 in the newer checkout before `_execute_tool`, and `agent/tool_executor.py` `_dispatch_authorized_once` returns at line 738 in v0.22.2 and line 734 in the newer checkout before `execute`).
 
-Nothing is posted when the call is cron, yolo, approvals off, single-query, unattended, a `plugins.isolation` host process (`HERMES_PLUGIN_HOST_PROCESS` set to anything other than empty or `0`, including `1`), or when those Hermes helpers cannot be loaded.
+Hermes decides the modes. This plugin does not read them:
+
+- yolo (`--yolo` / `/yolo`) and `approvals.mode: off` skip the prompt and treat the call as approved while a person is present (`tools/approval.py` `_run_approval_gate`, the check at line 967 in v0.22.2). This plugin does not add a second refusal on top of those two modes.
+- cron, `hermes -q`, webhook, and other unattended sessions are refused in the `pre_tool_call` hook before Hermes consults a saved always line. The same refusal runs again in the handler, before any POST. Answering always does not make a later cron, `-q`, or webhook call send the move.
+
+A `plugins.isolation` host process (`HERMES_PLUGIN_HOST_PROCESS` set to anything other than empty or `0`, including `1`) still refuses the move, because that process cannot show the conversation. Requires Hermes `>=0.21.6`, the first stable release that provides `ctx.current_cron_execution` (the watch uses it to tell a cron run from a manual one; without it the watch would say it cannot run because it looks like `plugins.isolation: host`) and that applies another plugin's `block` before `approve`.
+
+An empty `HERMES_HOME` scan with Hermes v0.22.2 and with origin-main is `Verdict: SAFE`, 12 findings, `Decision: ALLOWED — Allowed (community source, safe verdict)`. The findings are the JPEG marker in the snapshot check, the API key names in the changelog, and test subprocesses. They stay, because the snapshot check and the tests need them.
 
 `POST /api/job` bodies are only:
 
@@ -86,7 +111,7 @@ Temperatures are null when `GET /api/printer` returns 409 (`Printer is not opera
 hermes print-job-watch schedule --deliver telegram:123456 --schedule "*/5 * * * *"
 ```
 
-The default schedule is `*/5 * * * *`. Each run is at least one model turn. A turn that calls a tool makes two or more model requests. If the schedule is every 5 minutes, that is 288 runs a day. There is no daily cap. When this Hermes profile is not default, printed `hermes print-job-watch` (including unschedule), `hermes cron`, and `hermes plugins remove` lines include `-p <name>`. This plugin does not take `-p` or `--profile` as its own arguments.
+The default schedule is `*/5 * * * *`. Each run is at least one model turn. A turn that calls a tool makes two or more model requests. If the schedule is every 5 minutes, that is 288 runs a day. There is no daily cap. When this Hermes profile is not default, printed `hermes print-job-watch` (including unschedule), `hermes cron`, and `hermes plugins remove` lines include `-p <name>`. That name is `ctx.profile_name`, read once in `register`. A missing or unusable name is printed as the default profile, with no `-p`. This plugin does not import `hermes_cli.profiles`. This plugin does not take `-p` or `--profile` as its own arguments.
 
 The CLI takes `--deliver` and `--schedule`. Accepted targets are `origin`, `local`, `all`, `bot-chat`, `bot-chat:<profile>`, a platform Hermes cron delivers to, `platform:chat_id`, and a comma combination such as `origin,all`. `cli`, `cron`, and `api_server` are not delivery targets. `bot-chat` spends one model turn: the agent reads the report and acts on it. `local` is stored on this machine and is not sent to a chat. A `--deliver` value that looks like a schedule (`every`, `in`, `at`, a weekday, `weekdays`, `5m`, a leading digit, `*`, `@`, or an ISO timestamp) is refused, and the existing job is left as it is. A schedule faster than every 2 minutes, or one this plugin cannot measure, is refused and nothing is created.
 
@@ -96,7 +121,7 @@ The cron job only calls `print_job_watch`. It cannot pause, resume, or cancel.
 
 ## Stills
 
-`include_snapshot` on status fetches `OCTOPRINT_SNAPSHOT_URL` only when that URL has the same hostname as `OCTOPRINT_URL`. Another host is refused before any request. The HTTP client does not follow redirects. This plugin then accepts at most two redirects, and only when the API stays on the same origin or a still stays on the same hostname. A redirect to another host is not followed, and that host does not receive `X-Api-Key`. `X-Api-Key` is sent on a still only when the snapshot URL is the same origin (scheme, host, and port). A different port on the same host is fetched without the key. Only a JPEG or PNG is kept, at most `snapshot_max_bytes` (default 2_000_000, hard maximum 5_000_000). A body shorter than `Content-Length`, or a declared length over the cap, is discarded. At most 20 stills are kept, named `still-<ms>-1.jpg` or `.png`.
+`include_snapshot` on status fetches `OCTOPRINT_SNAPSHOT_URL` only when that URL has the same hostname as `OCTOPRINT_URL`. Another host is refused before any request. The HTTP client does not follow redirects. A response to a request that sent `X-Api-Key` is not followed, including a redirect that stays on the same origin. That call fails in place, and the key is not sent to the next URL. A still that was requested without the key may follow at most two redirects, and only while the target stays on the same hostname. A redirect to another host is not followed, and that host does not receive `X-Api-Key`. `X-Api-Key` is sent on a still only when the snapshot URL is the same origin (scheme, host, and port). A different port on the same host is fetched without the key. Only a JPEG or PNG is kept, at most `snapshot_max_bytes` (default 2_000_000, hard maximum 5_000_000). A body shorter than `Content-Length`, or a declared length over the cap, is discarded. At most 20 stills are kept, named `still-<ms>-1.jpg` or `.png`.
 
 ## Limits
 

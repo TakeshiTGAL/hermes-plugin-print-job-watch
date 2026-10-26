@@ -1,10 +1,13 @@
-"""Fail-closed gates. A move is refused when Hermes cannot ask a person."""
+"""Move plans and the public pre_tool_call line. Hermes asks the person."""
 from __future__ import annotations
 
-import importlib
+import hashlib
 import json
 import os
-import uuid
+import sys
+import threading
+import time
+import unicodedata
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,6 +15,12 @@ PLUGIN_NAME = "print-job-watch"
 ACTIONS = ("pause", "resume", "cancel")
 HOST_PROCESS_ENV = "HERMES_PLUGIN_HOST_PROCESS"
 REASON_BUDGET = 300
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_UNATTENDED_PLATFORMS = frozenset({"webhook", "msgraph_webhook", "api_server"})
+UNATTENDED_MOTION = (
+    "BLOCKED: pause, resume, and cancel are refused in cron, hermes -q, webhook, "
+    "and other unattended sessions, including after always. Nothing was sent."
+)
 
 BODIES = {
     "pause": {"command": "pause", "action": "pause"},
@@ -23,19 +32,6 @@ BODIES = {
 def in_plugin_host_process() -> bool:
     """True unless the variable is unset, empty, or 0. Hermes itself treats only 1 as the host."""
     return os.environ.get(HOST_PROCESS_ENV, "").strip() not in {"", "0"}
-
-
-def _load(module: str, name: str) -> tuple[str, Any]:
-    try:
-        mod = importlib.import_module(module)
-    except Exception:
-        return "failed", None
-    if not hasattr(mod, name):
-        return "missing", None
-    try:
-        return "ok", getattr(mod, name)
-    except Exception:
-        return "failed", None
 
 
 def reason_fits(text: str) -> bool:
@@ -57,15 +53,75 @@ def approval_text(action: str, origin: str) -> str:
     body = json.dumps(BODIES[action], separators=(",", ":"), sort_keys=True)
     return (
         f"OctoPrint at {where}: POST /api/job {body}. {meaning} "
-        "This one call only; choose once."
+        "always is only this action at this origin while a person is present, not cron, -q, or webhook."
     )
 
 
-def one_call_rule_key(action: str) -> str:
-    return f"print_job_control:{action}:{uuid.uuid4().hex}"
+def session_value(name: str) -> str:
+    """Session value Hermes itself reads: the context var, then the process environment.
+
+    The module is already imported when a Hermes turn is running. This does not
+    import it. If it is absent, the process environment is the fallback.
+    """
+    module = sys.modules.get("gateway.session_context")
+    reader = getattr(module, "get_session_env", None) if module is not None else None
+    if callable(reader):
+        try:
+            return str(reader(name, "") or "")
+        except Exception:
+            pass
+    return os.environ.get(name, "") or ""
+
+
+def _truthy(value: str) -> bool:
+    return value.strip().lower() in _TRUTHY
+
+
+def cron_mark_active() -> bool:
+    """True when the public cron execution mark is bound. Import failure is not cron."""
+    try:
+        from cron.execution_identity import current_cron_execution
+    except Exception:
+        return False
+    try:
+        return current_cron_execution() is not None
+    except Exception:
+        return False
+
+
+def motion_is_unattended() -> bool:
+    """True for cron, hermes -q, and webhook-style platforms. The plugin host is separate."""
+    if cron_mark_active():
+        return True
+    if _truthy(session_value("HERMES_CRON_SESSION")):
+        return True
+    if _truthy(session_value("HERMES_SINGLE_QUERY_SESSION")):
+        return True
+    platform = session_value("HERMES_SESSION_PLATFORM").strip().lower()
+    return platform in _UNATTENDED_PLATFORMS
+
+
+def plan_digest(action: str, origin: str) -> str:
+    """Hermes stores session and always under this key. The same plan matches; another does not."""
+    body = json.dumps({"action": action, "origin": origin}, sort_keys=True, separators=(",", ":"))
+    return "print_job_control:" + hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+def fold_action(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = unicodedata.normalize("NFKC", value).strip().lower()
+    if text in ACTIONS:
+        return text
+    return None
 
 
 def motion_block_reason(action: str) -> str | None:
+    """Local refusals. yolo and approvals off stay Hermes's gate. Unattended motion stops here.
+
+    Hermes checks a saved always line before its own cron, -q, and unattended deny,
+    so this refusal has to happen in the hook, before that line is consulted.
+    """
     if action not in ACTIONS:
         return (
             f"'{action}' is not allowed. The only actions are pause, resume, and cancel. "
@@ -76,71 +132,117 @@ def motion_block_reason(action: str) -> str | None:
             "BLOCKED: this plugin is running in a separate plugin-host process (plugins.isolation: host). "
             "Pause, resume, and cancel are refused there. Use plugins.isolation: in_process to move the printer."
         )
-    checks = (
-        ("tools.approval_context", "_is_cron_approval_context", "a cron job", "BLOCKED: cron cannot pause, resume, or cancel the printer. The watch only reports."),
-        ("tools.approval", "_yolo_active", "yolo", "BLOCKED: Hermes yolo is on, so the approval gate would not ask a person. Turn yolo off and try again."),
-        ("tools.approval_context", "_get_approval_mode", "approvals.mode", "BLOCKED: Hermes approvals are off, so nobody would be asked. Turn approvals on and try again."),
-        ("tools.approval_context", "_is_single_query_approval_context", "a single-query session", "BLOCKED: a single-query session cannot move the printer."),
-        ("tools.approval_context", "_is_unattended_platform_approval_context", "an unattended session", "BLOCKED: an unattended session cannot move the printer."),
-    )
-    for module, name, label, blocked in checks:
-        status, fn = _load(module, name)
-        if status != "ok":
-            return f"BLOCKED: could not check {label}, so the printer was not moved."
-        try:
-            value = fn()
-        except Exception:
-            return f"BLOCKED: the check for {label} failed, so the printer was not moved."
-        if name == "_get_approval_mode":
-            if value == "off":
-                return blocked
-        elif value:
-            return blocked
+    if motion_is_unattended():
+        return UNATTENDED_MOTION
     return None
 
 
-def request_motion_approval(action: str, origin: str) -> tuple[bool, str, str]:
-    """Returns approved, message, rule_key. No Hermes call when the move is already blocked."""
-    reason = motion_block_reason(action)
-    if reason:
-        return False, reason, ""
-    text = approval_text(action, origin)
-    if not reason_fits(text):
-        return False, (
-            "BLOCKED: the approval question would not fit in one message, so it was not sent and the printer was not moved."
-        ), ""
-    status, fn = _load("tools.approval", "request_tool_approval")
-    if status != "ok":
-        return False, "BLOCKED: Hermes approval could not be loaded, so the printer was not moved.", ""
-    rule_key = one_call_rule_key(action)
+_LOCK = threading.Lock()
+_STASH_TTL = 600
+_STASH: dict[tuple, tuple[tuple[str, str, str], float]] = {}
+_origin_getter: Callable[[], str] | None = None
+
+
+def _ids(kwargs: dict) -> tuple[str, str]:
+    return (str(kwargs.get("session_id") or ""), str(kwargs.get("task_id") or ""))
+
+
+def _stash_key(payload: dict, ids: tuple[str, str]) -> tuple:
+    # The whole call, plus the session and task. One action does not cover another spelling,
+    # another session, or another task.
+    fields = {str(key): payload[key] for key in payload}
+    return ("print_job_control", json.dumps(fields, sort_keys=True, default=str), ids[0], ids[1])
+
+
+def set_origin_getter(getter: Callable[[], str] | None) -> None:
+    global _origin_getter
+    _origin_getter = getter
+
+
+def _origin() -> str:
+    getter = _origin_getter
+    if getter is None:
+        return ""
     try:
-        result = fn("print_job_control", text, rule_key=rule_key)
+        value = getter()
     except Exception:
-        return False, "BLOCKED: the Hermes approval request failed, so the printer was not moved.", rule_key
-    if not isinstance(result, dict) or result.get("approved") is not True:
-        message = str(result.get("message") or "") if isinstance(result, dict) else ""
-        return False, message or "BLOCKED: the printer move was not approved.", rule_key
-    return True, "", rule_key
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def _plan(action: str, origin: str) -> str:
+    return approval_text(action, origin)
+
+
+def remember_move(payload: dict, ids: tuple[str, str], plan: tuple[str, str, str]) -> None:
+    with _LOCK:
+        _STASH[_stash_key(payload, ids)] = (plan, time.monotonic())
+
+
+def take_move(payload: dict, ids: tuple[str, str], plan: tuple[str, str, str]) -> tuple[bool, str]:
+    """Pop this call's plan. Missing, stale, or different means do not post."""
+    with _LOCK:
+        found = _STASH.pop(_stash_key(payload, ids), None)
+    if found is None:
+        return False, "BLOCKED: the printer move was not approved. Nothing was sent."
+    stored, made = found
+    if time.monotonic() - made > _STASH_TTL:
+        return False, "BLOCKED: the approval is too old. Nothing was sent."
+    if stored != plan:
+        return False, "The target changed after the preview. Nothing was sent."
+    return True, ""
+
+
+def on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs: Any):
+    """Approve one pause, resume, or cancel. Reads and watches stay silent."""
+    if tool_name != "print_job_control":
+        return None
+    # Every writer call in this session and task starts clean. A preview kept after a
+    # refusal, a block, or a later modify must not authorize a different call.
+    # Other rooms keep their own previews while they wait for an answer.
+    room = _ids(kwargs)
+    with _LOCK:
+        for key in [k for k in _STASH if k[2:] == room]:
+            del _STASH[key]
+    payload = dict(args) if isinstance(args, dict) else {}
+    if set(payload) - {"action"}:
+        return None
+    if "action" not in payload or payload.get("action") in (None, ""):
+        return None
+    action = fold_action(payload.get("action"))
+    if action is None:
+        return None
+    blocked = motion_block_reason(action)
+    if blocked:
+        return {"action": "block", "message": blocked}
+    origin = _origin()
+    text = _plan(action, origin)
+    if not reason_fits(text) or "\n" in text or "`" in text:
+        return {
+            "action": "block",
+            "message": "BLOCKED: the approval question would not fit in one message, so nothing was sent.",
+        }
+    remember_move(payload, _ids(kwargs), (action, origin, text))
+    return {"action": "approve", "message": text, "rule_key": plan_digest(action, origin)}
 
 
 def write_guard_error(path: str) -> str | None:
-    status, fn = _load("agent.file_safety", "get_write_denied_error")
-    if status != "ok":
-        return "BLOCKED: Hermes's write guard could not be loaded, so the file was not saved."
+    """None only when ``path`` stays inside this plugin's data directory."""
     try:
-        denied = fn(path)
+        root = plugin_data_dir().resolve()
+        target = Path(path).resolve()
+        target.relative_to(root)
     except Exception:
-        return "BLOCKED: Hermes's write guard raised, so the file was not saved."
-    if denied:
-        return str(denied)
+        return "BLOCKED: the file is outside the plugin data directory, so it was not saved."
     return None
 
 
 def plugin_data_dir() -> Path:
-    status, fn = _load("plugins.plugin_storage", "plugin_data_dir")
-    if status != "ok":
-        raise RuntimeError("plugin_data_dir is not available")
-    path = fn(PLUGIN_NAME)
+    try:
+        from plugins.plugin_storage import plugin_data_dir as read_dir
+    except Exception as exc:
+        raise RuntimeError("plugin_data_dir is not available") from exc
+    path = read_dir(PLUGIN_NAME)
     if not isinstance(path, Path):
         path = Path(path)
     return path

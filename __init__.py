@@ -2,28 +2,37 @@
 
 import asyncio
 import concurrent.futures
+import contextvars
 
 
 def register(ctx) -> None:
     if __package__:
+        from .gates import on_pre_tool_call, set_origin_getter
+        from .client import parse_origin
         from .service import (
             DEFAULT_SCHEDULE,
             TOOLSET,
+            bind_cron_reader,
             control,
             deps_from_config,
             hermes_line,
+            remember_profile_name,
             schedule,
             status,
             unschedule,
             watch,
         )
     else:
+        from gates import on_pre_tool_call, set_origin_getter
+        from client import parse_origin
         from service import (
             DEFAULT_SCHEDULE,
             TOOLSET,
+            bind_cron_reader,
             control,
             deps_from_config,
             hermes_line,
+            remember_profile_name,
             schedule,
             status,
             unschedule,
@@ -31,19 +40,25 @@ def register(ctx) -> None:
         )
 
     def _deps():
-        import os
+        from agent.secret_scope import get_secret
         return deps_from_config(
             ctx.get_config,
-            url=os.environ.get("OCTOPRINT_URL", ""),
-            api_key=os.environ.get("OCTOPRINT_API_KEY", ""),
-            snapshot_url=os.environ.get("OCTOPRINT_SNAPSHOT_URL", ""),
+            url=get_secret("OCTOPRINT_URL") or "",
+            api_key=get_secret("OCTOPRINT_API_KEY") or "",
+            snapshot_url=get_secret("OCTOPRINT_SNAPSHOT_URL") or "",
         )
+
+    try:
+        reported = ctx.profile_name
+    except Exception:
+        reported = None
+    remember_profile_name(reported)
 
     def _status(args, **_kwargs):
         return status(_deps(), args or {})
 
-    def _control(args, **_kwargs):
-        return control(_deps(), args or {})
+    def _control(args, **kwargs):
+        return control(_deps(), args or {}, **kwargs)
 
     def _watch(args, **_kwargs):
         return watch(_deps(), args or {})
@@ -54,11 +69,13 @@ def register(ctx) -> None:
         schema={
             "name": "print_job_status",
             "description": (
-                "Read one OctoPrint printer through the configured URL. "
+                "OctoPrint printer: read job progress and temperatures. "
                 "Returns job state, connection state, completion, temperatures, and printTimeLeft. "
                 "printTimeLeft is OctoPrint's estimate and may be 0. A disconnected printer is not described as paused. "
-                "include_snapshot saves one JPEG or PNG still only after Hermes's write guard allows it. "
-                "Does not move the printer and cannot change the URL."
+                "include_snapshot saves one JPEG or PNG still only when the path stays inside the plugin data directory. "
+                "Does not move the printer and cannot change the URL. "
+                "It reads a 3D printer, including the hotend temperature. "
+                "The current job includes print time remaining, and include_snapshot can save a webcam snapshot."
             ),
             "parameters": {
                 "type": "object",
@@ -76,11 +93,12 @@ def register(ctx) -> None:
         schema={
             "name": "print_job_control",
             "description": (
-                "Pause, resume, or cancel the configured printer. "
-                "Asks Hermes for approval on every call; an earlier session or always answer is not reused. "
-                "Answering always adds one unused allowlist line; choose once. "
-                "Does nothing if this is cron, yolo, approvals off, single-query, an unattended session, "
-                "or a plugins.isolation host process, or if that check cannot be loaded. "
+                "OctoPrint printer: pause, resume, or cancel the job. "
+                "Hermes shows one pre_tool_call line and asks before the post. "
+                "always applies only to this same action at this same origin while a person is present. "
+                "Hermes yolo and approvals off skip that prompt while a person is present. "
+                "Cron, hermes -q (single-query), webhook, and unattended sessions refuse the move, including after always. "
+                "A plugins.isolation host process refuses the move. "
                 "Pause is sent only for Printing and Printing from SD, not for Paused. "
                 "Pause is not sent during Resuming or a state that starts with Starting, "
                 "including Starting print from SD and Starting to send file to SD; the print is still going. "
@@ -106,7 +124,7 @@ def register(ctx) -> None:
         schema={
             "name": "print_job_watch",
             "description": (
-                "Compare the printer with the previous sample. Reports printer_disconnected, error, "
+                "OctoPrint printer: report a finished or failed job. Reports printer_disconnected, error, "
                 "complete (after Printing, Printing from SD, Pausing, Paused, Resuming, or Finishing), "
                 "paused (after Printing, Printing from SD, Pausing, or Resuming, with the connection up), "
                 "cancelled, and stalled (Printing or Printing from SD, with a numeric filepos). "
@@ -155,7 +173,7 @@ def register(ctx) -> None:
 
     async def _slash(raw_args: str) -> str:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(slash_pool, _slash_work, raw_args)
+        return await loop.run_in_executor(slash_pool, contextvars.copy_context().run, _slash_work, raw_args)
 
     ctx.register_command(
         "print-job-watch",
@@ -201,6 +219,32 @@ def register(ctx) -> None:
         handler_fn=_cli,
         description="Read OctoPrint and schedule a watch. Pause, resume, and cancel stay on the tool, which asks for approval.",
     )
+    try:
+        from pathlib import Path
+        ctx.register_skill(
+            "octoprint-job",
+            Path(__file__).resolve().parent / "skills" / "octoprint-job" / "SKILL.md",
+            description=(
+                "OctoPrint job progress and temperatures. "
+                "Before web_search, use tool_search to find the OctoPrint tools and tool_call to run them."
+            ),
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("print-job-watch skill was not registered", exc_info=True)
+
+    def _origin() -> str:
+        from agent.secret_scope import get_secret
+        raw = get_secret("OCTOPRINT_URL") or ""
+        try:
+            return parse_origin(raw).value
+        except Exception:
+            return raw
+
+    set_origin_getter(_origin)
+    if hasattr(ctx, "current_cron_execution"):
+        bind_cron_reader(ctx.current_cron_execution)
+    ctx.register_hook("pre_tool_call", on_pre_tool_call)
 
 
 __all__ = ["register"]

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -9,7 +11,8 @@ import pytest
 import gates
 from client import PERMISSION_ERROR, ApiError, parse_origin
 from client import OctoPrint
-from service import CANNOT_WATCH, Deps, canonical_deliver, control, deliver_looks_like_schedule, schedule, status, unschedule, watch
+import service
+from service import CANNOT_WATCH, Deps, bind_cron_reader, canonical_deliver, control, deliver_looks_like_schedule, schedule, status, unschedule, watch
 
 
 SECRET = "test-api-key-value"
@@ -207,7 +210,7 @@ def test_cancel_text_says_it_cannot_be_resumed(tmp_path):
     assert json.loads([call for call in script.calls if call["method"] == "POST"][0]["body"]) == {"command": "cancel"}
 
 
-def test_second_call_uses_a_new_rule_key(tmp_path):
+def test_same_plan_reuses_the_rule_key(tmp_path):
     keys = []
 
     def approve(text, rule):
@@ -221,8 +224,9 @@ def test_second_call_uses_a_new_rule_key(tmp_path):
     assert len(keys) == 1
     script.replies = view("Printing") + view("Printing") + [(204, None)] + view("Paused")
     control(base, {"action": "pause"})
-    assert keys[0] != keys[1]
-    assert keys[0].startswith("print_job_control:pause:")
+    assert keys[0] == keys[1]
+    assert keys[0].startswith("print_job_control:")
+    assert len(keys[0]) == len("print_job_control:") + 16
 
 
 def test_approval_over_300_chars_is_not_sent(tmp_path):
@@ -252,19 +256,9 @@ def test_timeout_says_it_may_have_arrived(tmp_path):
 
 
 def test_blocked_contexts_do_not_call_http(tmp_path, monkeypatch):
-    def loader(module, name):
-        if name == "_is_cron_approval_context":
-            return "ok", lambda: True
-        if name == "_get_approval_mode":
-            return "ok", lambda: "manual"
-        return "ok", lambda: False
-
-    monkeypatch.setattr(gates, "_load", loader)
-    assert "cron" in gates.motion_block_reason("pause")
-    monkeypatch.setattr(gates, "_load", lambda module, name: ("missing", None))
-    assert gates.motion_block_reason("pause").startswith("BLOCKED")
+    for key in ("HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION", "HERMES_SESSION_PLATFORM"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
-    monkeypatch.setattr(gates, "_load", lambda module, name: ("ok", (lambda: "manual") if name == "_get_approval_mode" else (lambda: False)))
     assert gates.motion_block_reason("pause") is None
     monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "0")
     assert gates.motion_block_reason("pause") is None
@@ -411,7 +405,8 @@ def test_corrupt_state_is_not_overwritten(tmp_path):
     assert path.read_text(encoding="utf-8") == "{"
 
 
-def test_schedule_refuses_a_schedule_word_as_deliver(tmp_path):
+def test_schedule_refuses_a_schedule_word_as_deliver(tmp_path, monkeypatch):
+    _install_platform_registry(monkeypatch, {})
     class Cron:
         def __init__(self):
             self.jobs = [{"id": "old", "name": "print-job-watch", "deliver": "telegram"}]
@@ -440,9 +435,34 @@ def test_schedule_refuses_a_schedule_word_as_deliver(tmp_path):
     assert canonical_deliver("origin,all") == "origin,all"
     assert canonical_deliver("bot-chat:desk") == "bot-chat:desk"
     assert canonical_deliver("cli") is None
+    assert canonical_deliver("telegram") is None
 
 
-def test_schedule_names_the_previous_deliver(tmp_path):
+def _install_platform_registry(monkeypatch, entries):
+    gateway_pkg = types.ModuleType("gateway")
+    gateway_pkg.__path__ = []
+    registry_mod = types.ModuleType("gateway.platform_registry")
+
+    class Registry:
+        def registered_names(self):
+            return list(entries)
+
+        def get(self, name):
+            if name not in entries:
+                return None
+
+            class Entry:
+                cron_deliver_env_var = entries[name]
+
+            return Entry()
+
+    registry_mod.platform_registry = Registry()
+    monkeypatch.setitem(sys.modules, "gateway", gateway_pkg)
+    monkeypatch.setitem(sys.modules, "gateway.platform_registry", registry_mod)
+
+
+def test_schedule_names_the_previous_deliver(tmp_path, monkeypatch):
+    _install_platform_registry(monkeypatch, {"discord": "DISCORD_BOT_TOKEN"})
     class Cron:
         def __init__(self):
             self.jobs = [{"id": "old", "name": "print-job-watch", "deliver": "telegram"}]
@@ -585,81 +605,42 @@ def test_same_origin_snapshot_sends_the_key_and_another_port_does_not(tmp_path):
     assert snaps and "X-Api-Key" in snaps[0]["header_names"]
 
 
-_HELPERS = (
-    ("tools.approval_context", "_is_cron_approval_context"),
-    ("tools.approval", "_yolo_active"),
-    ("tools.approval_context", "_get_approval_mode"),
-    ("tools.approval_context", "_is_single_query_approval_context"),
-    ("tools.approval_context", "_is_unattended_platform_approval_context"),
-)
-
-
-def _quiet_loader(module, name):
-    if name == "_get_approval_mode":
-        return "ok", lambda: "manual"
-    return "ok", lambda: False
-
-
-def test_each_motion_helper_fails_closed(monkeypatch):
+def test_host_process_refuses_a_move_without_a_private_check(monkeypatch):
+    for key in ("HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION", "HERMES_SESSION_PLATFORM"):
+        monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
-
-    def boom():
-        raise RuntimeError("boom")
-
-    for module, name in _HELPERS:
-        for status_name in ("missing", "failed"):
-            def loader(found_module, found_name, module=module, name=name, status_name=status_name):
-                if (found_module, found_name) == (module, name):
-                    return status_name, None
-                return _quiet_loader(found_module, found_name)
-
-            monkeypatch.setattr(gates, "_load", loader)
-            reason = gates.motion_block_reason("pause")
-            assert reason is not None and reason.startswith("BLOCKED"), (module, name, status_name, reason)
-
-        def raising(found_module, found_name, module=module, name=name):
-            if (found_module, found_name) == (module, name):
-                return "ok", boom
-            return _quiet_loader(found_module, found_name)
-
-        monkeypatch.setattr(gates, "_load", raising)
-        reason = gates.motion_block_reason("pause")
-        assert reason is not None and reason.startswith("BLOCKED"), (module, name, reason)
+    assert gates.motion_block_reason("pause") is None
+    monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "1")
+    reason = gates.motion_block_reason("pause")
+    assert reason is not None and reason.startswith("BLOCKED")
+    assert "host" in reason
 
 
-def test_approval_and_write_guard_fail_closed(monkeypatch):
-    monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
+def test_write_guard_fail_closed(monkeypatch):
+    import builtins
 
-    def loader(module, name):
-        if name == "request_tool_approval":
-            return "missing", None
-        return _quiet_loader(module, name)
+    real_import = builtins.__import__
 
-    monkeypatch.setattr(gates, "_load", loader)
-    approved, message, _rule = gates.request_motion_approval("pause", ORIGIN)
-    assert approved is False
-    assert "could not be loaded" in message
+    def blocked(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "agent.file_safety" or (name == "agent" and fromlist and "file_safety" in fromlist):
+            raise ImportError("guard missing")
+        return real_import(name, globals, locals, fromlist, level)
 
-    def explode(*_args, **_kwargs):
-        raise RuntimeError("boom")
-
-    def raising(module, name):
-        if name == "request_tool_approval":
-            return "ok", explode
-        return _quiet_loader(module, name)
-
-    monkeypatch.setattr(gates, "_load", raising)
-    approved, message, _rule = gates.request_motion_approval("pause", ORIGIN)
-    assert approved is False
-    assert "failed" in message
-
-    monkeypatch.setattr(gates, "_load", lambda module, name: ("missing", None))
+    monkeypatch.delitem(sys.modules, "agent.file_safety", raising=False)
+    monkeypatch.setattr(builtins, "__import__", blocked)
     assert gates.write_guard_error("/tmp/still.jpg").startswith("BLOCKED")
+
+    agent_pkg = types.ModuleType("agent")
+    agent_pkg.__path__ = []
+    safety_mod = types.ModuleType("agent.file_safety")
 
     def guard_boom(_path):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(gates, "_load", lambda module, name: ("ok", guard_boom))
+    safety_mod.get_write_denied_error = guard_boom
+    monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+    monkeypatch.setitem(sys.modules, "agent.file_safety", safety_mod)
+    monkeypatch.setattr(builtins, "__import__", real_import)
     assert gates.write_guard_error("/tmp/still.jpg").startswith("BLOCKED")
 
 
@@ -741,6 +722,32 @@ def test_manual_watch_leaves_the_cron_event(tmp_path):
     assert again["notify"] is True
     assert "Marked reported" in again["message"]
     assert "did not update" not in again["message"]
+
+
+def test_keyed_redirect_fails_in_place_and_does_not_follow():
+    script = Script([(302, {"error": "next"}), (200, {"state": "Printing"})])
+    client = OctoPrint(parse_origin(ORIGIN), SECRET, script)
+    with pytest.raises(ApiError) as caught:
+        client.get_json("/api/job")
+    assert caught.value.code == "redirect"
+    assert "API key" in caught.value.message
+    assert len(script.calls) == 1
+    assert script.calls[0]["url"].endswith("/api/job")
+    assert len(script.replies) == 1
+
+
+def test_profile_name_comes_from_register_not_a_private_helper():
+    service.remember_profile_name("desk")
+    try:
+        assert service.hermes_line("cron list") == "hermes -p desk cron list"
+        service.remember_profile_name("not a name")
+        assert service.hermes_line("cron list") == "hermes cron list"
+        service.remember_profile_name(None)
+        source = Path(service.__file__).read_text(encoding="utf-8")
+        assert "hermes_cli" not in source
+        assert "get_active_profile_name" not in source
+    finally:
+        service.remember_profile_name(None)
 
 
 def test_redirect_to_another_host_does_not_receive_the_key():
@@ -1078,33 +1085,28 @@ def test_first_sample_disconnect_is_not_paused(tmp_path):
 
 
 def test_host_and_unreadable_cron_helper_cannot_watch(tmp_path, monkeypatch):
-    import sys
-    import types
-
     monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
     script = Script(view("Paused"))
     monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "1")
     result = load(watch(deps(script, tmp_path)[0], {}))
     assert result["notify"] is True
     assert result["message"] == CANNOT_WATCH
+    assert result["error_type"] == "cannot_watch"
     assert "Nothing new" not in result["message"]
     assert result["events"] == []
     assert script.calls == []
     assert not (tmp_path / "watch_state.json").exists()
 
     monkeypatch.setenv("HERMES_PLUGIN_HOST_PROCESS", "0")
-    mod = types.ModuleType("tools.approval_context")
-    mod._is_cron_approval_context = lambda: False
-    monkeypatch.setitem(sys.modules, "tools.approval_context", mod)
+    bind_cron_reader(lambda: None)
     script = Script(view("Printing"))
     manual = load(watch(deps(script, tmp_path / "manual")[0], {}))
     assert manual["ok"] is True
     assert manual.get("error") is None
     assert script.calls
+    bind_cron_reader(None)
 
     monkeypatch.delenv("HERMES_PLUGIN_HOST_PROCESS", raising=False)
-    missing = types.ModuleType("tools.approval_context")
-    monkeypatch.setitem(sys.modules, "tools.approval_context", missing)
     script = Script(view("Paused"))
     renamed = load(watch(deps(script, tmp_path / "renamed")[0], {}))
     assert renamed["message"] == CANNOT_WATCH
@@ -1116,13 +1118,12 @@ def test_host_and_unreadable_cron_helper_cannot_watch(tmp_path, monkeypatch):
     def boom():
         raise RuntimeError("boom")
 
-    broken = types.ModuleType("tools.approval_context")
-    broken._is_cron_approval_context = boom
-    monkeypatch.setitem(sys.modules, "tools.approval_context", broken)
+    bind_cron_reader(boom)
     script = Script(view("Paused"))
     failed = load(watch(deps(script, tmp_path / "boom")[0], {}))
     assert failed["message"] == CANNOT_WATCH
     assert script.calls == []
+    bind_cron_reader(None)
 
 
 def test_non_default_profile_prints_p_flag(tmp_path, monkeypatch):
@@ -1147,6 +1148,8 @@ def test_non_default_profile_prints_p_flag(tmp_path, monkeypatch):
     made = load(schedule(base, "*/5 * * * *", "local"))
     assert "hermes -p desk cron list" in made["message"]
     assert "hermes -p desk print-job-watch unschedule" in made["message"]
+    assert "enabled_toolsets" in made["message"]
+    assert "hermes cron" not in made["message"]
     assert "--profile" not in made["message"]
     refused = load(schedule(base, "*/5 * * * *", "5m"))
     assert "hermes -p desk print-job-watch schedule --deliver" in refused["next_step"]
@@ -1156,9 +1159,150 @@ def test_non_default_profile_prints_p_flag(tmp_path, monkeypatch):
     assert removed["ok"] is True
     assert "hermes -p desk plugins remove" in removed["message"]
     assert "--profile" not in removed["message"]
-    bare = Deps(url=ORIGIN, api_key=SECRET, data_dir=tmp_path / "bare", now=lambda: 0, sleep=lambda _s: None, write_guard=lambda _p: None)
+    class _Failed:
+        returncode = 1
+        stdout = ""
+        stderr = "cron is not available in this test"
+
+    bare = Deps(
+        url=ORIGIN, api_key=SECRET, data_dir=tmp_path / "bare", now=lambda: 0, sleep=lambda _s: None,
+        write_guard=lambda _p: None, cron_run=lambda _argv: _Failed(),
+    )
     missing = load(schedule(bare, "*/5 * * * *", "local"))
     assert "hermes -p desk cron create" in missing["next_step"]
+    assert "from cron import jobs" not in Path(__file__).resolve().parents[1].joinpath("service.py").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"HERMES_CRON_SESSION": "1"},
+        {"HERMES_SINGLE_QUERY_SESSION": "1"},
+        {"HERMES_SESSION_PLATFORM": "webhook"},
+        {"HERMES_SESSION_PLATFORM": "api_server"},
+    ],
+)
+def test_unattended_env_posts_nothing_even_when_the_approver_says_yes(tmp_path, monkeypatch, env):
+    for key in ("HERMES_CRON_SESSION", "HERMES_SINGLE_QUERY_SESSION", "HERMES_SESSION_PLATFORM"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    script = Script(view("Printing") + view("Printing") + [(204, None)] + view("Paused"))
+    result = load(control(
+        deps(script, tmp_path, blocker=gates.motion_block_reason, approver=lambda text, rule: (True, "yes"))[0],
+        {"action": "pause"},
+    ))
+    assert result["moved"] is False
+    assert "including after always" in result["message"]
+    assert script.calls == []
+
+
+def test_approval_text_fits_for_the_sample_origin():
+    for action in ("pause", "resume", "cancel"):
+        text = gates.approval_text(action, ORIGIN)
+        assert gates.reason_fits(text), (action, len(text))
+        assert "while a person is present" in text
+        assert "\n" not in text and "`" not in text
+
+
+def test_write_guard_stays_inside_the_plugin_directory(tmp_path, monkeypatch):
+    root = tmp_path / "data"
+    root.mkdir()
+    monkeypatch.setattr(gates, "plugin_data_dir", lambda: root)
+    assert gates.write_guard_error(str(root / "still.jpg")) is None
+    assert gates.write_guard_error(str(tmp_path / "outside.jpg")).startswith("BLOCKED")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link = root / "escape"
+    link.symlink_to(outside)
+    assert gates.write_guard_error(str(link / "still.jpg")).startswith("BLOCKED")
+
+
+def test_public_cron_create_parses_list_and_refuses_a_blind_list(tmp_path):
+    calls = []
+
+    class Done:
+        def __init__(self, code, out, err=""):
+            self.returncode = code
+            self.stdout = out
+            self.stderr = err
+
+    def run(argv):
+        calls.append(list(argv))
+        if "list" in argv:
+            return Done(0, "No scheduled jobs in profile 'default'.\n")
+        if "create" in argv:
+            return Done(0, "Created job: job123\n  Name: print-job-watch\n")
+        return Done(1, "", "unexpected")
+
+    result = load(schedule(deps(Script([]), tmp_path, cron_run=run)[0], "*/5 * * * *", "local"))
+    assert result["ok"] is True
+    assert result["job_id"] == "job123"
+    assert "including after always" in result["message"]
+    assert "enabled_toolsets" not in json.dumps(calls)
+    created = [argv for argv in calls if "create" in argv]
+    assert created and created[0][created[0].index("create") + 1] == "*/5 * * * *"
+
+    calls.clear()
+
+    def blind(argv):
+        calls.append(list(argv))
+        return Done(0, "totally unexpected output\n")
+
+    refused = load(schedule(deps(Script([]), tmp_path, cron_run=blind)[0], "*/5 * * * *", "local"))
+    assert refused["error"] == "no_cron"
+    assert calls and "create" not in calls[0]
+
+
+def test_public_cron_replaces_the_named_job(tmp_path, monkeypatch):
+    _install_platform_registry(monkeypatch, {"discord": "DISCORD_BOT_TOKEN"})
+    listed = (
+        "Scheduled Jobs (profile: default)\n"
+        "  old [active]\n"
+        "    Name:      print-job-watch\n"
+        "    Deliver:   telegram\n"
+    )
+
+    class Done:
+        def __init__(self, code, out):
+            self.returncode = code
+            self.stdout = out
+            self.stderr = ""
+
+    def run(argv):
+        if "list" in argv:
+            return Done(0, listed)
+        if "create" in argv:
+            assert "discord" in argv
+            return Done(0, "Created job: new\n")
+        if "remove" in argv:
+            assert "old" in argv
+            return Done(0, "Removed\n")
+        return Done(1, "")
+
+    result = load(schedule(deps(Script([]), tmp_path, cron_run=run)[0], "*/5 * * * *", "discord"))
+    assert result["job_id"] == "new"
+    assert result["previous_deliver"] == "telegram"
+
+
+def test_unschedule_says_no_cron_job_when_the_list_is_empty(tmp_path):
+    class Done:
+        returncode = 0
+        stdout = "No scheduled jobs in profile 'default'.\n"
+        stderr = ""
+
+    result = load(unschedule(deps(Script([]), tmp_path, cron_run=lambda _argv: Done())[0]))
+    assert result["ok"] is True
+    assert "No cron job was found" in result["message"]
+
+
+def test_sources_do_not_import_private_cron_or_file_safety():
+    root = Path(__file__).resolve().parents[1]
+    for name in ("service.py", "gates.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert "from cron import jobs" not in text
+        assert "agent.file_safety" not in text
+        assert "cron.jobs" not in text
 
 
 def test_register_does_not_import_tests():
@@ -1174,20 +1318,8 @@ def test_public_text_uses_the_same_sentences():
         root / "plugin.yaml",
         root / "__init__.py",
     ]
-    ship = None
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / "ship" / "octoprint-print-watch"
-        if (candidate / "pr_body.md").is_file() and (candidate / "print-job-watch.yaml").is_file():
-            ship = candidate
-            break
-    if ship is not None:
-        files.extend([
-            ship / "pr_body.md",
-            ship / "print-job-watch.yaml",
-        ])
     complete = "Printing, Printing from SD, Pausing, Paused, Resuming, or Finishing"
     paused = "Printing, Printing from SD, Pausing, or Resuming"
-    watch_job = "The watch is a cron job (a model turn every 5 minutes by default) that stays after uninstall until you run unschedule."
     for path in files:
         text = " ".join(path.read_text(encoding="utf-8").split())
         assert CANNOT_WATCH in text, path.name
@@ -1197,19 +1329,280 @@ def test_public_text_uses_the_same_sentences():
         assert "reported every run" not in text
         assert "Put the delivery target first" not in text
         assert "model-free" not in text
-        if path.name in {"README.md", "plugin.yaml", "pr_body.md", "__init__.py", "print-job-watch.yaml"}:
-            assert complete in text, path.name
-            assert paused in text, path.name
-        if path.name == "print-job-watch.yaml":
-            raw = path.read_text(encoding="utf-8")
-            start = raw.index('description: "') + len('description: "')
-            description = raw[start:raw.index('"\n', start)]
-            assert watch_job in description
-            assert "Complete is after" not in description
-            assert len(description) <= 1500
+        assert complete in text, path.name
+        assert paused in text, path.name
         if path.name == "README.md":
             assert "not sent again" in text or "does not send a cron event again" in text
             assert "Printing or Printing from SD" in text
             assert "not loaded by `register()`" in text
         if path.name == "__init__.py":
             assert "single-query" in text
+
+
+_MISSING_URL = "OCTOPRINT_URL is empty, so nothing was requested."
+_ENV_READ = __import__("re").compile(
+    r"""os\s*\.\s*(?:getenv\s*\(|environ\s*\.\s*get\s*\(|environ\s*\[\s*)\s*['\"](?:OCTOPRINT_URL|OCTOPRINT_API_KEY|OCTOPRINT_SNAPSHOT_URL)['\"]"""
+)
+
+
+def _release_scope(scope, token):
+    if token is not None:
+        try:
+            scope.reset_secret_scope(token)
+        except ValueError:
+            pass
+    scope.set_secret_scope(None)
+    scope.set_multiplex_active(False)
+
+
+class _HeaderScript:
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def __call__(self, method, url, headers, body, timeout, cap):
+        self.calls.append({"method": method, "url": url, "headers": dict(headers)})
+        status_code, payload = self.replies.pop(0)
+        raw = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
+        return status_code, {"content-type": "application/json"}, raw
+
+
+_ORIGINAL_CLIENT = None
+
+
+def _load_handlers(monkeypatch, transport):
+    import importlib.util
+    import sys
+
+    pytest.importorskip("agent.secret_scope")
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("print_job_watch_scope_plugin", root / "__init__.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    class Ctx:
+        def __init__(self):
+            self.tools = {}
+
+        def register_tool(self, name, toolset, schema, handler, **kwargs):
+            self.tools[name] = handler
+
+        def register_command(self, name, handler, description=""):
+            self._slash = handler
+
+        async def command(self, raw_args):
+            return await self._slash(raw_args)
+
+        def register_cli_command(self, name, help, setup_fn, handler_fn=None, description=""):
+            return None
+
+        def register_hook(self, name, callback):
+            return None
+
+        def get_config(self):
+            return {}
+
+    ctx = Ctx()
+    module.register(ctx)
+    global _ORIGINAL_CLIENT
+    status_fn = next(
+        cell.cell_contents
+        for cell in ctx.tools["print_job_status"].__closure__ or ()
+        if getattr(cell.cell_contents, "__name__", "") == "status"
+    )
+    if _ORIGINAL_CLIENT is None:
+        _ORIGINAL_CLIENT = status_fn.__globals__["_client"]
+    status_fn.__globals__["_client"] = _ORIGINAL_CLIENT
+    if transport is not None:
+        import client as client_mod
+
+        def factory(deps):
+            return client_mod.OctoPrint(client_mod.parse_origin(deps.url), deps.api_key, transport=transport)
+
+        status_fn.__globals__["_client"] = factory
+    return ctx
+
+
+def test_scope_value_is_used_when_environ_differs(monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("OCTOPRINT_URL", "http://env.example:5000")
+    monkeypatch.setenv("OCTOPRINT_API_KEY", "env-key")
+    monkeypatch.setenv("OCTOPRINT_SNAPSHOT_URL", "http://env.example:9/snap")
+    script = _HeaderScript(view("Operational"))
+    ctx = _load_handlers(monkeypatch, script)
+    seen = {}
+    status_fn = next(
+        cell.cell_contents
+        for cell in ctx.tools["print_job_status"].__closure__
+        if getattr(cell.cell_contents, "__name__", "") == "status"
+    )
+    real_client = status_fn.__globals__["_client"]
+
+    def factory(deps):
+        seen["url"] = deps.url
+        seen["key"] = deps.api_key
+        seen["snap"] = deps.snapshot_url
+        return real_client(deps)
+
+    status_fn.__globals__["_client"] = factory
+    token = scope.set_secret_scope({
+        "OCTOPRINT_URL": ORIGIN,
+        "OCTOPRINT_API_KEY": "scope-key",
+        "OCTOPRINT_SNAPSHOT_URL": "http://printer.example:8080/?action=snapshot",
+    })
+    try:
+        raw = ctx.tools["print_job_status"]({})
+    finally:
+        status_fn.__globals__["_client"] = _ORIGINAL_CLIENT
+        _release_scope(scope, token)
+    assert json.loads(raw)["ok"] is True
+    assert seen["url"] == ORIGIN
+    assert seen["key"] == "scope-key"
+    assert seen["snap"] == "http://printer.example:8080/?action=snapshot"
+    assert script.calls[0]["headers"].get("X-Api-Key") == "scope-key"
+    assert "env.example" not in script.calls[0]["url"]
+    assert all(call["headers"].get("X-Api-Key") != "env-key" for call in script.calls)
+
+
+def test_slash_status_and_watch_use_scope_under_multiplex(monkeypatch, tmp_path):
+    import asyncio
+    import service as service_mod
+
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("OCTOPRINT_URL", "http://env.example:5000")
+    monkeypatch.setenv("OCTOPRINT_API_KEY", "env-key")
+    monkeypatch.setenv("OCTOPRINT_SNAPSHOT_URL", "http://env.example:9/snap")
+    monkeypatch.setattr(service_mod, "plugin_data_dir", lambda: tmp_path)
+    script = _HeaderScript(view("Operational") + view("Operational"))
+    ctx = _load_handlers(monkeypatch, script)
+    seen = []
+    status_fn = next(
+        cell.cell_contents
+        for cell in ctx.tools["print_job_status"].__closure__
+        if getattr(cell.cell_contents, "__name__", "") == "status"
+    )
+    real_client = status_fn.__globals__["_client"]
+
+    def factory(deps):
+        seen.append((deps.url, deps.api_key, deps.snapshot_url))
+        return real_client(deps)
+
+    status_fn.__globals__["_client"] = factory
+    status_fn.__globals__["plugin_data_dir"] = lambda: tmp_path
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope({
+        "OCTOPRINT_URL": ORIGIN,
+        "OCTOPRINT_API_KEY": "scope-key",
+        "OCTOPRINT_SNAPSHOT_URL": "http://printer.example:8080/?action=snapshot",
+    })
+    try:
+        status_text = asyncio.run(ctx.command("status"))
+        watch_text = asyncio.run(ctx.command("watch"))
+    finally:
+        status_fn.__globals__["_client"] = _ORIGINAL_CLIENT
+        _release_scope(scope, token)
+    status_body = json.loads(status_text)
+    watch_body = json.loads(watch_text)
+    assert status_body["ok"] is True
+    assert watch_body["ok"] is True and watch_body["recorded"] is False
+    assert seen[0] == (ORIGIN, "scope-key", "http://printer.example:8080/?action=snapshot")
+    assert seen[1][0] == ORIGIN and seen[1][1] == "scope-key"
+    assert all(call["headers"].get("X-Api-Key") == "scope-key" for call in script.calls)
+    assert "env.example" not in status_text and "env-key" not in status_text
+    assert "env.example" not in watch_text and "env-key" not in watch_text
+
+
+def test_multiplex_scope_miss_does_not_read_environ(monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("OCTOPRINT_URL", "http://env.example:5000")
+    monkeypatch.setenv("OCTOPRINT_API_KEY", "env-key")
+    monkeypatch.setenv("OCTOPRINT_SNAPSHOT_URL", "http://env.example:9/snap")
+    ctx = _load_handlers(monkeypatch, None)
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope({"UNRELATED": "present"})
+    try:
+        raw = ctx.tools["print_job_status"]({})
+    finally:
+        _release_scope(scope, token)
+    body = json.loads(raw)
+    assert body["ok"] is False and body["error"] == "bad_url"
+    assert body["message"] == _MISSING_URL
+    assert "env.example" not in raw
+    assert "env-key" not in raw
+
+
+def test_unscoped_multiplex_raises_and_does_not_call_upstream(monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.setenv("OCTOPRINT_URL", ORIGIN)
+    monkeypatch.setenv("OCTOPRINT_API_KEY", "env-key")
+    script = _HeaderScript(view("Operational"))
+    ctx = _load_handlers(monkeypatch, script)
+    scope.set_multiplex_active(True)
+    token = scope.set_secret_scope(None)
+    try:
+        with pytest.raises(scope.UnscopedSecretError):
+            ctx.tools["print_job_status"]({})
+    finally:
+        _release_scope(scope, token)
+    assert script.calls == []
+
+
+def test_unset_credentials_keep_the_fixed_error(monkeypatch):
+    scope = pytest.importorskip("agent.secret_scope")
+    monkeypatch.delenv("OCTOPRINT_URL", raising=False)
+    monkeypatch.delenv("OCTOPRINT_API_KEY", raising=False)
+    monkeypatch.delenv("OCTOPRINT_SNAPSHOT_URL", raising=False)
+    cleared = scope.set_secret_scope(None)
+    scope.set_multiplex_active(False)
+    ctx = _load_handlers(monkeypatch, None)
+    try:
+        body = json.loads(ctx.tools["print_job_status"]({}))
+    finally:
+        _release_scope(scope, cleared)
+    assert body["ok"] is False and body["error"] == "bad_url"
+    assert body["message"] == _MISSING_URL
+
+
+def test_plugin_code_does_not_read_octoprint_from_environ():
+    root = Path(__file__).resolve().parents[1]
+    for path in sorted(root.glob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        assert _ENV_READ.search(text) is None, path.name
+
+
+def test_opener_ignores_https_proxy(monkeypatch):
+    import socket
+    import urllib.request
+
+    import client
+
+    passed = []
+    real_build = urllib.request.build_opener
+
+    def spy(*handlers):
+        passed.append(handlers)
+        return real_build(*handlers)
+
+    monkeypatch.setattr(client.urllib.request, "build_opener", spy)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.test:8443")
+    monkeypatch.setenv("https_proxy", "http://proxy.test:8443")
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.test:8443")
+    monkeypatch.setenv("http_proxy", "http://proxy.test:8443")
+    targets = []
+
+    def blocked(address, *args, **kwargs):
+        targets.append(address)
+        raise OSError("blocked")
+
+    monkeypatch.setattr(socket, "create_connection", blocked)
+    try:
+        client.default_transport("GET", "https://printer.example:5000/api/job", {}, None, 1.0, 100)
+    except Exception:
+        pass
+    proxies = [handler for handler in passed[0] if isinstance(handler, urllib.request.ProxyHandler)]
+    assert len(proxies) == 1 and proxies[0].proxies == {}
+    assert targets
+    hosts = [item[0] if isinstance(item, tuple) else item for item in targets]
+    assert hosts[0] == "printer.example"
+    assert "proxy.test" not in hosts

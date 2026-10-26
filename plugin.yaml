@@ -1,9 +1,10 @@
 name: print-job-watch
-version: 0.1.0
+version: 0.1.4
 manifest_version: 2
-requires_hermes: ">=0.21.4"
+requires_hermes: ">=0.21.6"
 description: >-
   Watch one printer from Hermes. This plugin can be used with OctoPrint.
+  OctoPrint is a web interface for 3D printers, and this reads the current print job's state, progress and temperatures.
   OctoPrint is a registered trademark owned by Gina Häußge (https://octoprint.org).
   Built on the OctoPrint REST API.
   Read job state, connection state, completion, temperatures, printTimeLeft,
@@ -11,12 +12,15 @@ description: >-
   it, including 0. A disconnected printer (connection Closed or Offline, or job
   Offline) is not described as paused. Error and Offline after error are errors
   even when GET /api/printer returns 409. A 409 by itself is not a state.
-  Pause, resume, or cancel only after a person approves that one call through
-  Hermes. An earlier session or always answer is not reused. Answering always adds one
-  unused allowlist line; choose once. That line does not approve the next move.
-  Nothing is sent on cron, yolo, approvals
-  off, single-query, unattended, a plugins.isolation host process, or when that
-  check cannot be loaded. POST /api/job sends command pause with action pause
+  Pause, resume, or cancel only after a person approves that one call.
+  The pre_tool_call hook returns one approve line, and Hermes shows it.
+  The rule key is a digest of the action and the OctoPrint origin.
+  Session and always cover only that plan. A different action or origin asks again.
+  Answering always writes one allowlist line for that plan.
+  Hermes yolo and approvals off skip the prompt while a person is present. Cron, hermes -q
+  (single-query), webhook, and unattended sessions refuse the move, including after always.
+  A plugins.isolation host process
+  still refuses the move. POST /api/job sends command pause with action pause
   or resume, or command cancel with no action. Pause is sent only for Printing and Printing from SD, not for Paused.
   It is not sent during Resuming or a state that starts with Starting, including
   Starting print from SD and Starting to send file to SD. HTTP 204 means accepted, not finished. Pausing is not a failure;
@@ -27,8 +31,8 @@ description: >-
   Printing from SD, Pausing, Paused, Resuming, or Finishing), paused (after Printing,
   Printing from SD, Pausing, or Resuming), cancelled, and stalled (Printing or Printing from SD). It
   does not move the printer. Slash and CLI watches only read; they do not update
-  the cron watch. A later chat failure does not send a cron event again. A redirect is not followed onto another host, so the API key
-  is not sent there. In process, an unreachable printer is reported once per
+  the cron watch. A later chat failure does not send a cron event again. A request that sent the API key
+  is not followed when OctoPrint redirects, including a redirect that stays on the same origin. In process, an unreachable printer is reported once per
   cause, then once a day, and once when it recovers. Under plugins.isolation: host, this form cannot watch the printer. Set plugins.isolation to in_process. Each run is at least one model
   turn. If the schedule is every 5 minutes, that is 288 runs a day. A turn that calls a tool makes two or
   more model requests. Removing the plugin leaves the cron job; run hermes print-job-watch unschedule.
@@ -40,6 +44,8 @@ provides_tools:
   - print_job_status
   - print_job_control
   - print_job_watch
+provides_hooks:
+  - pre_tool_call
 requires_env:
   - name: OCTOPRINT_URL
     description: "Single OctoPrint origin, for example http://printer.example:5000. No path, query, or userinfo. Plain http sends the API key unencrypted."
