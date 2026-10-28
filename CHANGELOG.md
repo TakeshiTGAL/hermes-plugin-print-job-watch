@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1
+
+schedule writes `HERMES_HOME/scripts/print-job-watch.py` and creates the job with `hermes cron create --no-agent --script` when `HERMES_HOME` is `HOME/.hermes`, the same as when `HERMES_HOME` points somewhere else. unschedule removes that job and that script in both places.
+
 ## 0.2.0
 
 Each watch run costs 0 tokens, and the unmanned run holds no tools. `schedule` writes `HERMES_HOME/scripts/print-job-watch.py` and creates the job with `hermes cron create --no-agent --script`, or switches an existing job with `hermes cron edit --script --no-agent`. Empty stdout sends nothing. The script binds the profile secret scope, then reads the printer URL and API key, and does not print the key. The cron subprocess is the hermes next to the running interpreter. The watch cron no longer narrows tools in `pre_tool_call` and no longer stores a model prompt. Pause, resume, and cancel still ask while a person is present. Cancel still uses a new rule key on every call. cron, `hermes -q`, webhook, and unattended sessions still refuse the move, including after always. `unschedule` removes the job and the script and keeps the watch state.

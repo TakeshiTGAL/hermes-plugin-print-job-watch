@@ -1216,28 +1216,10 @@ def _hermes_bin() -> str:
     return shutil.which("hermes") or "hermes"
 
 
-def _user_hermes_home(home: Path) -> bool:
-    """The person's own Hermes directory is never a place this plugin writes."""
-    try:
-        return home.resolve() == (Path.home() / ".hermes").resolve()
-    except OSError:
-        return False
-
-
-def _hermes_home_path() -> Path | None:
-    home = os.environ.get("HERMES_HOME", "").strip()
-    if not home:
-        return None
-    path = Path(home)
-    if _user_hermes_home(path):
-        return None
-    return path
-
-
 def _run_hermes_cron(deps: Deps, args: list[str]) -> _Cmd:
     """Run ``hermes cron``. ``deps.cron_run`` replaces the child process in tests.
 
-    An unset home, or the user Hermes directory, does not start a process.
+    An unset home does not start a process.
     """
     argv = [_hermes_bin(), "cron", *args]
     runner = deps.cron_run
@@ -1247,8 +1229,6 @@ def _run_hermes_cron(deps: Deps, args: list[str]) -> _Cmd:
     home = os.environ.get("HERMES_HOME", "").strip()
     if not home:
         return _Cmd(127, "", "HERMES_HOME is unset, so hermes cron was not started.")
-    if _user_hermes_home(Path(home)):
-        return _Cmd(127, "", "HERMES_HOME is the user Hermes directory, so hermes cron was not started.")
     import subprocess
     env = os.environ.copy()
     # copy() keeps PYTHONPATH. Hermes 0.21.6 and later pass dependency
@@ -1399,18 +1379,16 @@ def _cron(deps: Deps) -> Any:
 
 
 def watch_script_path() -> Path | None:
-    home = _hermes_home_path()
-    if home is None:
+    home = os.environ.get("HERMES_HOME", "").strip()
+    if not home:
         return None
-    return home / "scripts" / SCRIPT_NAME
+    return Path(home) / "scripts" / SCRIPT_NAME
 
 
 def write_watch_script() -> str | None:
     """Write the relative script Hermes cron will run. None means it is in place."""
     path = watch_script_path()
     if path is None:
-        if os.environ.get("HERMES_HOME", "").strip():
-            return "HERMES_HOME is the user Hermes directory, so the watch script was not written."
         return "HERMES_HOME is unset, so the watch script was not written."
     payload = WATCH_SCRIPT.encode("utf-8")
     fd = None
@@ -1443,8 +1421,6 @@ def remove_watch_script() -> str | None:
     """Delete the watch script. None means it is gone, including when it was already absent."""
     path = watch_script_path()
     if path is None:
-        if os.environ.get("HERMES_HOME", "").strip():
-            return "HERMES_HOME is the user Hermes directory, so the watch script was not removed."
         return "HERMES_HOME is unset, so the watch script was not removed."
     if not path.is_file():
         return None

@@ -127,3 +127,48 @@ def test_hermes_bin_prefers_the_interpreter_sibling(tmp_path, monkeypatch):
     monkeypatch.setattr(service.sys, "executable", str(tmp_path / "python"))
     monkeypatch.setattr(service.shutil, "which", lambda _name: "/somewhere/else/hermes")
     assert service._hermes_bin() == str(sibling)
+
+
+def test_default_home_schedule_lists_a_no_agent_job_and_unschedule_removes_it(tmp_path, monkeypatch):
+    user = tmp_path / "user"
+    home = user / ".hermes"
+    data = home / "plugin-data" / "print-job-watch"
+    data.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(user))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    hermes = Path(sys.executable).parent / "hermes"
+    if not hermes.is_file():
+        pytest.skip("hermes is not next to this interpreter")
+    base, _clock = deps(Script([]), data)
+    out = json.loads(service.schedule(base, "*/5 * * * *", "local"))
+    assert out["ok"] is True, out
+    script = home / "scripts" / service.SCRIPT_NAME
+    assert script.is_file()
+    env = os.environ.copy()
+    listed = subprocess.run(
+        [str(hermes), "cron", "list"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+    assert listed.returncode == 0, listed.stderr
+    shown = listed.stdout + listed.stderr
+    assert "print-job-watch" in shown
+    assert "no-agent" in shown
+    gone = json.loads(service.unschedule(base))
+    assert gone["ok"] is True, gone
+    assert not script.exists()
+    after = subprocess.run(
+        [str(hermes), "cron", "list"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=env,
+        stdin=subprocess.DEVNULL,
+    )
+    assert after.returncode == 0, after.stderr
+    quiet = after.stdout + after.stderr
+    assert "print-job-watch" not in quiet
+    assert "No scheduled jobs" in quiet
