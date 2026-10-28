@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7
+
+The print-job-watch cron prompt tells the model that its first action is the tool_search tool, not text, with the query OctoPrint printer left unchanged, then to call tool_call so that its calls entry names print_job_watch with an empty arguments object, and not to reply until that tool has returned. If that tool is not in the tool list, the prompt tells the model to find it with tool_search and call it through tool_call. It does not say "Do not search". Web search is named separately: "Do not use web search." Running schedule again creates a new job with that prompt and removes the previous print-job-watch job. The previous job's prompt field is not edited in place.
+
 ## 0.1.6
 
 On a cron run whose public job name is `print-job-watch`, the `pre_tool_call` hook allows `print_job_watch` and the three bridge tools `tool_search`, `tool_describe`, and `tool_call`, and blocks every other tool before it runs. A `tool_call` that names another deferred tool reaches that hook under the inner name, so the other tool stays blocked. Pause, resume, and cancel stay refused. A cron job with another name, and a normal chat, are unchanged.

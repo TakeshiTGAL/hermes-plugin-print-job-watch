@@ -72,12 +72,16 @@ STILL_NAME = re.compile(r"still-[0-9]+-[0-9]+\.(jpg|png)\Z")
 CANNOT_WATCH = "Under plugins.isolation: host, this form cannot watch the printer. Set plugins.isolation to in_process."
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
 CRON_PROMPT = (
-    "Call the print_job_watch tool with no arguments. "
+    "Your first action is the tool_search tool, not text. "
+    "Use tool_search with the query OctoPrint printer. Do not change that query. "
+    "Then call tool_call so that its calls entry names print_job_watch with an empty arguments object. "
+    "Do not reply until print_job_watch has returned. "
+    "Call print_job_watch with no arguments. "
+    "If it is not in your tool list, find it with tool_search and call it through tool_call. "
     "Do not call print_job_control. Do not pause, resume, cancel, change a temperature, or send G-code. "
-    "If the tool result has notify true, reply with its message field and nothing else. "
+    "Do not use web search. "
     "If notify is false, reply with [SILENT]. "
-    "If the tool cannot be called or returns no notify field, reply with: "
-    "print_job_watch did not run, so the printer was not checked."
+    "If notify is true, reply with the message field and nothing else."
 )
 
 

@@ -1242,6 +1242,10 @@ def test_public_cron_create_parses_list_and_refuses_a_blind_list(tmp_path):
     assert "enabled_toolsets" not in json.dumps(calls)
     created = [argv for argv in calls if "create" in argv]
     assert created and created[0][created[0].index("create") + 1] == "*/5 * * * *"
+    assert service.CRON_PROMPT in created[0]
+    assert "find it with tool_search and call it through tool_call" in service.CRON_PROMPT
+    assert "Do not search" not in service.CRON_PROMPT
+    assert "Do not use web search." in service.CRON_PROMPT
 
     calls.clear()
 
@@ -1269,11 +1273,15 @@ def test_public_cron_replaces_the_named_job(tmp_path, monkeypatch):
             self.stdout = out
             self.stderr = ""
 
+    seen = []
+
     def run(argv):
+        seen.append(list(argv))
         if "list" in argv:
             return Done(0, listed)
         if "create" in argv:
             assert "discord" in argv
+            assert service.CRON_PROMPT in argv
             return Done(0, "Created job: new\n")
         if "remove" in argv:
             assert "old" in argv
@@ -1283,6 +1291,8 @@ def test_public_cron_replaces_the_named_job(tmp_path, monkeypatch):
     result = load(schedule(deps(Script([]), tmp_path, cron_run=run)[0], "*/5 * * * *", "discord"))
     assert result["job_id"] == "new"
     assert result["previous_deliver"] == "telegram"
+    kinds = ["create" if "create" in argv else "remove" if "remove" in argv else "list" for argv in seen]
+    assert kinds.index("create") < kinds.index("remove")
 
 
 def test_unschedule_says_no_cron_job_when_the_list_is_empty(tmp_path):
