@@ -462,6 +462,7 @@ def _install_platform_registry(monkeypatch, entries):
 
 
 def test_schedule_names_the_previous_deliver(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     _install_platform_registry(monkeypatch, {"discord": "DISCORD_BOT_TOKEN"})
     class Cron:
         def __init__(self):
@@ -471,21 +472,38 @@ def test_schedule_names_the_previous_deliver(tmp_path, monkeypatch):
             return list(self.jobs)
 
         def create_job(self, **kwargs):
-            job = {"id": "new", "name": kwargs["name"], "deliver": kwargs["deliver"], "schedule_display": kwargs["schedule"]}
-            self.jobs.append(job)
-            return job
+            raise AssertionError("an existing job is edited, not created again")
+
+        def update_job(self, job_id, updates):
+            assert job_id == "old"
+            assert updates["no_agent"] is True
+            assert updates["script"] == service.SCRIPT_NAME
+            self.jobs = [{
+                "id": "old",
+                "name": "print-job-watch",
+                "deliver": updates["deliver"],
+                "schedule_display": updates["schedule"],
+                "script": updates["script"],
+                "no_agent": True,
+            }]
+            return self.jobs[0]
 
         def remove_job(self, job_id):
-            self.jobs = [job for job in self.jobs if job["id"] != job_id]
+            raise AssertionError("edit keeps the job id")
 
     cron = Cron()
     result = load(schedule(deps(Script([]), tmp_path, cron_module=cron)[0], "*/5 * * * *", "discord"))
+    assert result["ok"] is True
+    assert result["job_id"] == "old"
     assert result["previous_deliver"] == "telegram"
     assert "telegram" in result["message"]
-    assert cron.jobs == [{"id": "new", "name": "print-job-watch", "deliver": "discord", "schedule_display": "*/5 * * * *"}]
+    assert cron.jobs[0]["no_agent"] is True
+    assert cron.jobs[0]["script"] == service.SCRIPT_NAME
+    assert (tmp_path / "home" / "scripts" / service.SCRIPT_NAME).is_file()
 
 
-def test_fast_schedule_is_refused(tmp_path):
+def test_fast_schedule_is_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     class Cron:
         def __init__(self):
             self.created = 0
@@ -1127,6 +1145,7 @@ def test_host_and_unreadable_cron_helper_cannot_watch(tmp_path, monkeypatch):
 
 
 def test_non_default_profile_prints_p_flag(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.setattr("service.active_profile_name", lambda: "desk")
 
     class Jobs:
@@ -1218,7 +1237,8 @@ def test_write_guard_stays_inside_the_plugin_directory(tmp_path, monkeypatch):
     assert gates.write_guard_error(str(link / "still.jpg")).startswith("BLOCKED")
 
 
-def test_public_cron_create_parses_list_and_refuses_a_blind_list(tmp_path):
+def test_public_cron_create_parses_list_and_refuses_a_blind_list(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     calls = []
 
     class Done:
@@ -1242,10 +1262,10 @@ def test_public_cron_create_parses_list_and_refuses_a_blind_list(tmp_path):
     assert "enabled_toolsets" not in json.dumps(calls)
     created = [argv for argv in calls if "create" in argv]
     assert created and created[0][created[0].index("create") + 1] == "*/5 * * * *"
-    assert service.CRON_PROMPT in created[0]
-    assert "find it with tool_search and call it through tool_call" in service.CRON_PROMPT
-    assert "Do not search" not in service.CRON_PROMPT
-    assert "Do not use web search." in service.CRON_PROMPT
+    assert "--no-agent" in created[0]
+    assert created[0][created[0].index("--script") + 1] == service.SCRIPT_NAME
+    assert "tool_search" not in created[0]
+    assert "Do not search" not in " ".join(created[0])
 
     calls.clear()
 
@@ -1258,7 +1278,8 @@ def test_public_cron_create_parses_list_and_refuses_a_blind_list(tmp_path):
     assert calls and "create" not in calls[0]
 
 
-def test_public_cron_replaces_the_named_job(tmp_path, monkeypatch):
+def test_public_cron_switches_the_named_job(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     _install_platform_registry(monkeypatch, {"discord": "DISCORD_BOT_TOKEN"})
     listed = (
         "Scheduled Jobs (profile: default)\n"
@@ -1279,23 +1300,24 @@ def test_public_cron_replaces_the_named_job(tmp_path, monkeypatch):
         seen.append(list(argv))
         if "list" in argv:
             return Done(0, listed)
-        if "create" in argv:
+        if "edit" in argv:
+            assert "--no-agent" in argv
+            assert service.SCRIPT_NAME in argv
             assert "discord" in argv
-            assert service.CRON_PROMPT in argv
-            return Done(0, "Created job: new\n")
-        if "remove" in argv:
             assert "old" in argv
-            return Done(0, "Removed\n")
+            return Done(0, "Updated job old\n")
         return Done(1, "")
 
     result = load(schedule(deps(Script([]), tmp_path, cron_run=run)[0], "*/5 * * * *", "discord"))
-    assert result["job_id"] == "new"
+    assert result["ok"] is True, result
+    assert result["job_id"] == "old"
     assert result["previous_deliver"] == "telegram"
-    kinds = ["create" if "create" in argv else "remove" if "remove" in argv else "list" for argv in seen]
-    assert kinds.index("create") < kinds.index("remove")
+    kinds = ["edit" if "edit" in argv else "list" if "list" in argv else "other" for argv in seen]
+    assert kinds == ["list", "edit"]
 
 
-def test_unschedule_says_no_cron_job_when_the_list_is_empty(tmp_path):
+def test_unschedule_says_no_cron_job_when_the_list_is_empty(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     class Done:
         returncode = 0
         stdout = "No scheduled jobs in profile 'default'.\n"

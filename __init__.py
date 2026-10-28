@@ -188,7 +188,7 @@ def register(ctx) -> None:
         subs.add_parser("watch", help="Compare with the previous sample. Does not move the printer.")
         scheduled = subs.add_parser(
             "schedule",
-            help="Create a Hermes cron job named print-job-watch. That job allows print_job_watch and the tool search bridge, and blocks every other tool. Each run is at least one model turn.",
+            help="Create a Hermes cron job named print-job-watch. Each run costs 0 tokens and holds no tools. The job runs a script and does not call a model.",
         )
         scheduled.add_argument(
             "--deliver",
@@ -199,7 +199,7 @@ def register(ctx) -> None:
             ),
         )
         scheduled.add_argument("--schedule", default=DEFAULT_SCHEDULE, help="Cron expression. No faster than every 2 minutes.")
-        subs.add_parser("unschedule", help="Remove the cron job. Keeps watch state and snapshots.")
+        subs.add_parser("unschedule", help="Remove the cron job and the watch script. Keeps watch state and snapshots.")
 
     def _cli(args) -> None:
         cmd = getattr(args, "print_job_command", None) or "status"

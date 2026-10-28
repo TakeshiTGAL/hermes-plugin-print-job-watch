@@ -1,9 +1,9 @@
 name: print-job-watch
-version: 0.1.7
+version: 0.2.0
 manifest_version: 2
 requires_hermes: ">=0.21.6"
 description: >-
-  Watch one printer from Hermes. This plugin can be used with OctoPrint.
+  Each watch run costs 0 tokens, and the unmanned run holds no tools. Watch one printer from Hermes. This plugin can be used with OctoPrint.
   OctoPrint is a web interface for 3D printers, and this reads the current print job's state, progress and temperatures.
   OctoPrint is a registered trademark owned by Gina Häußge (https://octoprint.org).
   Built on the OctoPrint REST API.
@@ -31,12 +31,10 @@ description: >-
   A cron watch can report printer_disconnected, error, complete (after Printing,
   Printing from SD, Pausing, Paused, Resuming, or Finishing), paused (after Printing,
   Printing from SD, Pausing, or Resuming), cancelled, and stalled (Printing or Printing from SD). It
-  does not move the printer. hermes cron create cannot set a toolset, so the job lists this profile's cron tools. On a run whose job name is print-job-watch, pre_tool_call allows print_job_watch and the bridge tools tool_search, tool_describe, and tool_call, and blocks every other tool. Other cron jobs and chats are unchanged. Running schedule again creates a new print-job-watch job with the current prompt and removes the previous one, so the stored instruction tells the model to call print_job_watch, or to find it with tool_search and call it through tool_call when it is not in the tool list. Slash and CLI watches only read; they do not update
+  does not move the printer. schedule writes a script and creates one cron job that does not call a model. Empty script output sends nothing. Running schedule again switches an existing job to that script. A job made by 0.1.x keeps its model turn until the next schedule. The create command cannot set a tool list, which does not matter here because the unmanned run holds no tools. Slash and CLI watches only read; they do not update
   the cron watch. A later chat failure does not send a cron event again. A request that sent the API key
   is not followed when OctoPrint redirects, including a redirect that stays on the same origin. In process, an unreachable printer is reported once per
-  cause, then once a day, and once when it recovers. Under plugins.isolation: host, this form cannot watch the printer. Set plugins.isolation to in_process. Each run is at least one model
-  turn. If the schedule is every 5 minutes, that is 288 runs a day. A turn that calls a tool makes two or
-  more model requests. Removing the plugin leaves the cron job; run hermes print-job-watch unschedule.
+  cause, then once a day, and once when it recovers. Under plugins.isolation: host, this form cannot watch the printer. Set plugins.isolation to in_process. The scheduled script is not that form, so that setting does not stop the watch. Removing the plugin leaves the cron job and the script; run hermes print-job-watch unschedule. Unschedule removes both.
 author: TakeshiTGAL
 license: MIT
 homepage: https://github.com/TakeshiTGAL/hermes-plugin-print-job-watch

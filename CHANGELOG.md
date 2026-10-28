@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.0
+
+Each watch run costs 0 tokens, and the unmanned run holds no tools. `schedule` writes `HERMES_HOME/scripts/print-job-watch.py` and creates the job with `hermes cron create --no-agent --script`, or switches an existing job with `hermes cron edit --script --no-agent`. Empty stdout sends nothing. The script binds the profile secret scope, then reads the printer URL and API key, and does not print the key. The cron subprocess is the hermes next to the running interpreter. The watch cron no longer narrows tools in `pre_tool_call` and no longer stores a model prompt. Pause, resume, and cancel still ask while a person is present. Cancel still uses a new rule key on every call. cron, `hermes -q`, webhook, and unattended sessions still refuse the move, including after always. `unschedule` removes the job and the script and keeps the watch state.
+
 ## 0.1.7
 
 The print-job-watch cron prompt tells the model that its first action is the tool_search tool, not text, with the query OctoPrint printer left unchanged, then to call tool_call so that its calls entry names print_job_watch with an empty arguments object, and not to reply until that tool has returned. If that tool is not in the tool list, the prompt tells the model to find it with tool_search and call it through tool_call. It does not say "Do not search". Web search is named separately: "Do not use web search." Running schedule again creates a new job with that prompt and removes the previous print-job-watch job. The previous job's prompt field is not edited in place.
