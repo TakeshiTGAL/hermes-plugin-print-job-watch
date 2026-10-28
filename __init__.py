@@ -71,8 +71,8 @@ def register(ctx) -> None:
             "description": (
                 "OctoPrint printer: read job progress and temperatures. "
                 "Returns job state, connection state, completion, temperatures, and printTimeLeft. "
-                "printTimeLeft is OctoPrint's estimate and may be 0. A disconnected printer is not described as paused. "
-                "include_snapshot saves one JPEG or PNG still only when the path stays inside the plugin data directory. "
+                "printTimeLeft says how long until the print finishes, and it may be 0. A disconnected printer is not described as paused. "
+                "include_snapshot saves one JPEG or PNG camera view of the printer, and only when the path stays inside the plugin data directory. "
                 "Does not move the printer and cannot change the URL. "
                 "It reads a 3D printer, including the hotend temperature. "
                 "The current job includes print time remaining, and include_snapshot can save a webcam snapshot."
@@ -94,8 +94,9 @@ def register(ctx) -> None:
             "name": "print_job_control",
             "description": (
                 "OctoPrint printer: pause, resume, or cancel the job. "
+                "Cancel stops the print. "
                 "Hermes shows one pre_tool_call line and asks before the post. "
-                "always applies only to this same action at this same origin while a person is present. "
+                "always on pause or resume applies only to that action at that origin while a person is present. "
                 "Hermes yolo and approvals off skip that prompt while a person is present. "
                 "Cron, hermes -q (single-query), webhook, and unattended sessions refuse the move, including after always. "
                 "A plugins.isolation host process refuses the move. "
@@ -187,7 +188,7 @@ def register(ctx) -> None:
         subs.add_parser("watch", help="Compare with the previous sample. Does not move the printer.")
         scheduled = subs.add_parser(
             "schedule",
-            help="Create a Hermes cron job that only calls print_job_watch. Each run is at least one model turn.",
+            help="Create a Hermes cron job named print-job-watch. That job blocks every tool except print_job_watch. Each run is at least one model turn.",
         )
         scheduled.add_argument(
             "--deliver",

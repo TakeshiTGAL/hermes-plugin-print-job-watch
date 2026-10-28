@@ -1,5 +1,5 @@
 name: print-job-watch
-version: 0.1.4
+version: 0.1.5
 manifest_version: 2
 requires_hermes: ">=0.21.6"
 description: >-
@@ -14,9 +14,10 @@ description: >-
   even when GET /api/printer returns 409. A 409 by itself is not a state.
   Pause, resume, or cancel only after a person approves that one call.
   The pre_tool_call hook returns one approve line, and Hermes shows it.
-  The rule key is a digest of the action and the OctoPrint origin.
+  The rule key for pause and resume is a digest of the action and the OctoPrint origin.
   Session and always cover only that plan. A different action or origin asks again.
-  Answering always writes one allowlist line for that plan.
+  Answering always on pause or resume writes one allowlist line for that plan.
+  Cancel uses a new rule key on every call, so always does not cover the next cancel.
   Hermes yolo and approvals off skip the prompt while a person is present. Cron, hermes -q
   (single-query), webhook, and unattended sessions refuse the move, including after always.
   A plugins.isolation host process
@@ -30,7 +31,7 @@ description: >-
   A cron watch can report printer_disconnected, error, complete (after Printing,
   Printing from SD, Pausing, Paused, Resuming, or Finishing), paused (after Printing,
   Printing from SD, Pausing, or Resuming), cancelled, and stalled (Printing or Printing from SD). It
-  does not move the printer. Slash and CLI watches only read; they do not update
+  does not move the printer. hermes cron create cannot set a toolset, so the job lists this profile's cron tools. On a run whose job name is print-job-watch, pre_tool_call blocks every tool except print_job_watch. Other cron jobs and chats are unchanged. Slash and CLI watches only read; they do not update
   the cron watch. A later chat failure does not send a cron event again. A request that sent the API key
   is not followed when OctoPrint redirects, including a redirect that stays on the same origin. In process, an unreachable printer is reported once per
   cause, then once a day, and once when it recovers. Under plugins.isolation: host, this form cannot watch the printer. Set plugins.isolation to in_process. Each run is at least one model

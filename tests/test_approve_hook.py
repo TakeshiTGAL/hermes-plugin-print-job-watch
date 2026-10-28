@@ -339,6 +339,73 @@ def test_always_then_webhook_context_is_blocked_without_process_env(hermes, monk
     assert block and "including after always" in block
 
 
+def test_watch_cron_blocks_other_tools_and_leaves_other_jobs_alone(hermes):
+    from cron.execution_identity import enter_cron_execution, exit_cron_execution
+
+    token = enter_cron_execution(
+        {"id": "watch-job", "name": "print-job-watch"},
+        "exec-watch",
+        {"source": "builtin"},
+    )
+    try:
+        terminal, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "terminal", {"command": "id"}, session_id="s1", task_id="t1",
+        )
+        status, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "print_job_status", {}, session_id="s1", task_id="t1",
+        )
+        watch = hermes._get_pre_tool_call_directive_details("print_job_watch", {})
+        control, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "print_job_control", {"action": "pause"}, session_id="s1", task_id="t1",
+        )
+    finally:
+        exit_cron_execution(token)
+    assert terminal and "print_job_watch" in terminal
+    assert status and "BLOCKED" in status
+    assert watch.action is None
+    assert control and "including after always" in control
+
+    other = enter_cron_execution(
+        {"id": "note-job", "name": "daily-note"},
+        "exec-other",
+        {"source": "builtin"},
+    )
+    try:
+        left, _modified = hermes._dispatch_pre_tool_call_hooks(
+            "terminal", {"command": "id"}, session_id="s1", task_id="t1",
+        )
+        still = hermes._get_pre_tool_call_directive_details("print_job_status", {})
+    finally:
+        exit_cron_execution(other)
+    assert left is None
+    assert still.action is None
+
+    chat, _modified = hermes._dispatch_pre_tool_call_hooks(
+        "terminal", {"command": "id"}, session_id="s1", task_id="t1",
+    )
+    assert chat is None
+
+
+def test_cancel_always_does_not_cover_the_next_call(hermes):
+    from tools.approval import approve_permanent
+
+    first = hermes._get_pre_tool_call_directive_details("print_job_control", {"action": "cancel"})
+    second = hermes._get_pre_tool_call_directive_details("print_job_control", {"action": "cancel"})
+    assert first.action == "approve"
+    assert second.action == "approve"
+    assert first.rule_key != second.rule_key
+    assert first.rule_key.startswith("print_job_control:")
+    assert "Each cancel asks again" in first.message
+    approve_permanent("plugin_rule:" + first.rule_key)
+    outcome, _modified = hermes._dispatch_pre_tool_call_hooks(
+        "print_job_control", {"action": "cancel"}, session_id="s1", task_id="t1",
+    )
+    assert outcome is not None
+    pause = hermes._get_pre_tool_call_directive_details("print_job_control", {"action": "pause"})
+    again = hermes._get_pre_tool_call_directive_details("print_job_control", {"action": "pause"})
+    assert pause.rule_key == again.rule_key
+
+
 def test_yolo_lets_hermes_skip_the_prompt_and_post(hermes, tmp_path, monkeypatch):
     import model_tools
     import tools.approval as approval

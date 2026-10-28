@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -12,7 +13,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 PLUGIN_NAME = "print-job-watch"
+WATCH_JOB_NAME = "print-job-watch"
 ACTIONS = ("pause", "resume", "cancel")
+WATCH_ONLY = (
+    "BLOCKED: this cron run is the print-job-watch job. "
+    "Only print_job_watch may run. Other tools are blocked before they run."
+)
 HOST_PROCESS_ENV = "HERMES_PLUGIN_HOST_PROCESS"
 REASON_BUDGET = 300
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -46,15 +52,18 @@ def approval_text(action: str, origin: str) -> str:
     where = origin or "(OCTOPRINT_URL not set)"
     if action == "pause":
         meaning = "This pauses the current print."
+        scope = "always is only this action at this origin while a person is present, not cron, -q, or webhook."
     elif action == "resume":
         meaning = "This resumes the paused print from where it stopped. It does not restart from the beginning."
+        scope = "always is only this action at this origin while a person is present, not cron, -q, or webhook."
     else:
         meaning = "Cancel ends the print; it cannot be resumed afterwards."
+        scope = (
+            "Each cancel asks again while a person is present. "
+            "Answering always does not cover the next cancel. cron, -q, and webhook refuse the move."
+        )
     body = json.dumps(BODIES[action], separators=(",", ":"), sort_keys=True)
-    return (
-        f"OctoPrint at {where}: POST /api/job {body}. {meaning} "
-        "always is only this action at this origin while a person is present, not cron, -q, or webhook."
-    )
+    return f"OctoPrint at {where}: POST /api/job {body}. {meaning} {scope}"
 
 
 def session_value(name: str) -> str:
@@ -77,16 +86,33 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in _TRUTHY
 
 
-def cron_mark_active() -> bool:
-    """True when the public cron execution mark is bound. Import failure is not cron."""
+def _current_cron():
+    """Public cron mark, or None when it is missing or cannot be read. Import failure is not cron."""
     try:
         from cron.execution_identity import current_cron_execution
     except Exception:
-        return False
+        return None
     try:
-        return current_cron_execution() is not None
+        return current_cron_execution()
     except Exception:
+        return None
+
+
+def cron_mark_active() -> bool:
+    """True when the public cron execution mark is bound. Import failure is not cron."""
+    return _current_cron() is not None
+
+
+def our_watch_cron() -> bool:
+    """True only when the running cron job is the one this plugin names print-job-watch.
+
+    A chat has no cron mark. Another cron job has a different job_name. Both leave
+    every other tool call untouched.
+    """
+    current = _current_cron()
+    if current is None:
         return False
+    return getattr(current, "job_name", None) == WATCH_JOB_NAME
 
 
 def motion_is_unattended() -> bool:
@@ -105,6 +131,19 @@ def plan_digest(action: str, origin: str) -> str:
     """Hermes stores session and always under this key. The same plan matches; another does not."""
     body = json.dumps({"action": action, "origin": origin}, sort_keys=True, separators=(",", ":"))
     return "print_job_control:" + hashlib.sha256(body.encode()).hexdigest()[:16]
+
+
+def rule_key_for(action: str, origin: str) -> str:
+    """Pause and resume keep the plan digest. Cancel is a new key on every call, so always cannot stick."""
+    if action == "cancel":
+        nonce = secrets.token_hex(8)
+        body = json.dumps(
+            {"action": action, "origin": origin, "call": nonce},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return "print_job_control:" + hashlib.sha256(body.encode()).hexdigest()[:16]
+    return plan_digest(action, origin)
 
 
 def fold_action(value: Any) -> str | None:
@@ -194,7 +233,14 @@ def take_move(payload: dict, ids: tuple[str, str], plan: tuple[str, str, str]) -
 
 
 def on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs: Any):
-    """Approve one pause, resume, or cancel. Reads and watches stay silent."""
+    """Approve one pause, resume, or cancel. Reads and watches stay silent.
+
+    On this plugin's own watch cron job, every tool except print_job_watch is blocked.
+    print_job_control still falls through to the unattended refusal below.
+    Any other cron job, and any chat, keeps the previous return for that tool.
+    """
+    if our_watch_cron() and tool_name not in {"print_job_watch", "print_job_control"}:
+        return {"action": "block", "message": WATCH_ONLY}
     if tool_name != "print_job_control":
         return None
     # Every writer call in this session and task starts clean. A preview kept after a
@@ -223,7 +269,7 @@ def on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs: An
             "message": "BLOCKED: the approval question would not fit in one message, so nothing was sent.",
         }
     remember_move(payload, _ids(kwargs), (action, origin, text))
-    return {"action": "approve", "message": text, "rule_key": plan_digest(action, origin)}
+    return {"action": "approve", "message": text, "rule_key": rule_key_for(action, origin)}
 
 
 def write_guard_error(path: str) -> str | None:

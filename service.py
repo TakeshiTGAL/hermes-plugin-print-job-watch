@@ -1328,8 +1328,10 @@ def schedule(deps: Deps, when: str = DEFAULT_SCHEDULE, deliver: str = "") -> str
         "moved": False,
         "message": (
             f"Scheduled {JOB_NAME} ({created.get('schedule_display') or when}). Results are {where}{replaced} "
-            "The create command cannot set enabled_toolsets, so the job uses this profile's platform toolsets "
-            "and may include more than print_job_watch. The prompt tells the agent to call print_job_watch only. "
+            "The create command cannot set enabled_toolsets, so the job is created with this profile's platform toolsets "
+            "and the model can see those tool names. On a run whose job name is print-job-watch, "
+            "the pre_tool_call hook blocks every tool except print_job_watch. "
+            "Other cron jobs and chats are not changed. "
             "Pause, resume, and cancel are refused in that cron session, including after always. "
             "Each run is at least one model turn; a turn that calls a tool makes two or more model requests. "
             "If the saved schedule is every 5 minutes, that is 288 runs a day. "

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.5
+
+On a cron run whose public job name is `print-job-watch`, the `pre_tool_call` hook blocks every tool except `print_job_watch` before it runs. `hermes cron create` still cannot set a toolset, so the model can see the profile's other tool names. A cron job with another name, and a normal chat, are unchanged. Cancel uses a new rule key on every call. Answering always on cancel does not cover the next cancel. Pause and resume keep one rule key for that action at that origin while a person is present.
+
 ## 0.1.4
 
 Pause, resume, and cancel are refused in cron, `hermes -q`, webhook, and other unattended sessions, including after always. The `pre_tool_call` hook blocks before Hermes reads a saved allowlist line, and the handler blocks again before any POST. yolo and `approvals.mode: off` are unchanged: while a person is present, Hermes skips the prompt. Scheduling uses the public `hermes cron create`, `list`, and `remove` commands. `hermes cron create` cannot set a toolset, so the job uses the profile's cron toolsets. The watch that cannot run under `plugins.isolation: host` now returns `error_type` `cannot_watch`, the same value as `error`.
