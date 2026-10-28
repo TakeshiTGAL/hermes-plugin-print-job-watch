@@ -188,7 +188,7 @@ def register(ctx) -> None:
         subs.add_parser("watch", help="Compare with the previous sample. Does not move the printer.")
         scheduled = subs.add_parser(
             "schedule",
-            help="Create a Hermes cron job named print-job-watch. That job blocks every tool except print_job_watch. Each run is at least one model turn.",
+            help="Create a Hermes cron job named print-job-watch. That job allows print_job_watch and the tool search bridge, and blocks every other tool. Each run is at least one model turn.",
         )
         scheduled.add_argument(
             "--deliver",

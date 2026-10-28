@@ -17,8 +17,18 @@ WATCH_JOB_NAME = "print-job-watch"
 ACTIONS = ("pause", "resume", "cancel")
 WATCH_ONLY = (
     "BLOCKED: this cron run is the print-job-watch job. "
-    "Only print_job_watch may run. Other tools are blocked before they run."
+    "Only print_job_watch may run. tool_search, tool_describe, and tool_call may run "
+    "so the model can reach it. Other tools are blocked before they run."
 )
+# print_job_control is listed so the unattended refusal below still speaks.
+# The three bridge names are listed because a cron turn asks this hook about them.
+_WATCH_PASS = frozenset({
+    "print_job_watch",
+    "print_job_control",
+    "tool_search",
+    "tool_describe",
+    "tool_call",
+})
 HOST_PROCESS_ENV = "HERMES_PLUGIN_HOST_PROCESS"
 REASON_BUDGET = 300
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
@@ -235,11 +245,13 @@ def take_move(payload: dict, ids: tuple[str, str], plan: tuple[str, str, str]) -
 def on_pre_tool_call(tool_name: str = "", args: dict | None = None, **kwargs: Any):
     """Approve one pause, resume, or cancel. Reads and watches stay silent.
 
-    On this plugin's own watch cron job, every tool except print_job_watch is blocked.
-    print_job_control still falls through to the unattended refusal below.
+    On this plugin's own watch cron job, print_job_watch and the three bridge tools
+    pass. print_job_control still falls through to the unattended refusal below.
+    A cron turn peels a tool_call that names a real deferred tool down to that
+    inner name before this hook, so another tool is blocked under its own name.
     Any other cron job, and any chat, keeps the previous return for that tool.
     """
-    if our_watch_cron() and tool_name not in {"print_job_watch", "print_job_control"}:
+    if our_watch_cron() and tool_name not in _WATCH_PASS:
         return {"action": "block", "message": WATCH_ONLY}
     if tool_name != "print_job_control":
         return None

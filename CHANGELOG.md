@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.6
+
+On a cron run whose public job name is `print-job-watch`, the `pre_tool_call` hook allows `print_job_watch` and the three bridge tools `tool_search`, `tool_describe`, and `tool_call`, and blocks every other tool before it runs. A `tool_call` that names another deferred tool reaches that hook under the inner name, so the other tool stays blocked. Pause, resume, and cancel stay refused. A cron job with another name, and a normal chat, are unchanged.
+
 ## 0.1.5
 
 On a cron run whose public job name is `print-job-watch`, the `pre_tool_call` hook blocks every tool except `print_job_watch` before it runs. `hermes cron create` still cannot set a toolset, so the model can see the profile's other tool names. A cron job with another name, and a normal chat, are unchanged. Cancel uses a new rule key on every call. Answering always on cancel does not cover the next cancel. Pause and resume keep one rule key for that action at that origin while a person is present.

@@ -1,5 +1,5 @@
 name: print-job-watch
-version: 0.1.5
+version: 0.1.6
 manifest_version: 2
 requires_hermes: ">=0.21.6"
 description: >-
@@ -31,7 +31,7 @@ description: >-
   A cron watch can report printer_disconnected, error, complete (after Printing,
   Printing from SD, Pausing, Paused, Resuming, or Finishing), paused (after Printing,
   Printing from SD, Pausing, or Resuming), cancelled, and stalled (Printing or Printing from SD). It
-  does not move the printer. hermes cron create cannot set a toolset, so the job lists this profile's cron tools. On a run whose job name is print-job-watch, pre_tool_call blocks every tool except print_job_watch. Other cron jobs and chats are unchanged. Slash and CLI watches only read; they do not update
+  does not move the printer. hermes cron create cannot set a toolset, so the job lists this profile's cron tools. On a run whose job name is print-job-watch, pre_tool_call allows print_job_watch and the bridge tools tool_search, tool_describe, and tool_call, and blocks every other tool. Other cron jobs and chats are unchanged. Slash and CLI watches only read; they do not update
   the cron watch. A later chat failure does not send a cron event again. A request that sent the API key
   is not followed when OctoPrint redirects, including a redirect that stays on the same origin. In process, an unreachable printer is reported once per
   cause, then once a day, and once when it recovers. Under plugins.isolation: host, this form cannot watch the printer. Set plugins.isolation to in_process. Each run is at least one model

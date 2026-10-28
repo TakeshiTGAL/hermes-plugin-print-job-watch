@@ -386,6 +386,108 @@ def test_watch_cron_blocks_other_tools_and_leaves_other_jobs_alone(hermes):
     assert chat is None
 
 
+def test_watch_cron_lets_the_bridge_through_and_blocks_the_inner_tool(hermes):
+    """Own cron: bridge names pass, terminal is blocked, another cron and a chat are not.
+
+    handle_function_call of tool_call peels a deferred tool to its inner name before
+    the hook. terminal is not deferred, so that call is refused before the hook and
+    the handler does not run. print_job_watch is deferred and runs.
+    """
+    import json
+
+    import model_tools
+    from cron.execution_identity import enter_cron_execution, exit_cron_execution
+    from tools.registry import registry
+
+    def _hook(name, args=None):
+        message, _modified = hermes._dispatch_pre_tool_call_hooks(
+            name, args or {}, session_id="s1", task_id="t1",
+        )
+        return message
+
+    token = enter_cron_execution(
+        {"id": "watch-job", "name": "print-job-watch"},
+        "exec-bridge",
+        {"source": "builtin"},
+    )
+    try:
+        assert _hook("tool_call", {"calls": [{"name": "print_job_watch", "arguments": {}}]}) is None
+        assert _hook("tool_search", {"queries": ["OctoPrint job"]}) is None
+        assert _hook("tool_describe", {"names": ["print_job_watch"]}) is None
+        terminal = _hook("terminal", {"command": "id"})
+        watch = hermes._get_pre_tool_call_directive_details("print_job_watch", {})
+    finally:
+        exit_cron_execution(token)
+    assert terminal and "BLOCKED" in terminal and "print_job_watch" in terminal
+    assert watch.action is None
+
+    other = enter_cron_execution(
+        {"id": "note-job", "name": "daily-note"},
+        "exec-other-bridge",
+        {"source": "builtin"},
+    )
+    try:
+        left = _hook("terminal", {"command": "id"})
+    finally:
+        exit_cron_execution(other)
+    assert left is None
+    assert _hook("terminal", {"command": "id"}) is None
+
+    called = []
+
+    def _watch(args, **_kwargs):
+        called.append("print_job_watch")
+        return json.dumps({"ok": True, "tool": "print_job_watch"})
+
+    def _other(args, **_kwargs):
+        called.append("other_plugin_tool")
+        return json.dumps({"ok": True, "tool": "other_plugin_tool"})
+
+    def _schema(name):
+        return {
+            "name": name,
+            "description": name + " bridge probe.",
+            "parameters": {"type": "object", "properties": {}},
+        }
+
+    registry.register(name="print_job_watch", toolset="print_job_watch", schema=_schema("print_job_watch"), handler=_watch)
+    registry.register(name="other_plugin_tool", toolset="other_plugin", schema=_schema("other_plugin_tool"), handler=_other)
+    inner = enter_cron_execution(
+        {"id": "watch-job", "name": "print-job-watch"},
+        "exec-bridge-inner",
+        {"source": "builtin"},
+    )
+    try:
+        terminal_result = model_tools.handle_function_call(
+            "tool_call",
+            {"calls": [{"name": "terminal", "arguments": {"command": "true"}}]},
+            session_id="s1",
+            task_id="t1",
+        )
+        other_result = model_tools.handle_function_call(
+            "tool_call",
+            {"calls": [{"name": "other_plugin_tool", "arguments": {}}]},
+            session_id="s1",
+            task_id="t1",
+        )
+        own_result = model_tools.handle_function_call(
+            "tool_call",
+            {"calls": [{"name": "print_job_watch", "arguments": {}}]},
+            session_id="s1",
+            task_id="t1",
+        )
+    finally:
+        exit_cron_execution(inner)
+        registry.deregister("print_job_watch")
+        registry.deregister("other_plugin_tool")
+    assert "terminal" not in called
+    assert "directly-listed" in str(terminal_result)
+    assert "other_plugin_tool" not in called
+    assert "BLOCKED" in str(other_result)
+    assert called == ["print_job_watch"]
+    assert "print_job_watch" in str(own_result)
+
+
 def test_cancel_always_does_not_cover_the_next_call(hermes):
     from tools.approval import approve_permanent
 
